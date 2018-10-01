@@ -18,18 +18,17 @@
  * Each of the return statements included in this skeleton are
  * placeholders. You'll need to modify them as you write your code.
  */
-
 public class ProblemSet3 {
 	
 	/**
 	 * Make sure you're testing your code by calling your methods
 	 * from the main method!
 	 */
-	
+
 	public static void main(String[] args) {
-			
-	}
-	
+		ProblemSet3 ps3 = new ProblemSet3();
+		ps3.dateFashion(5,10);
+		ps3.fizzString("fig");
 	/*
 	 * You and your date are trying to get a table at a restaurant. The
 	 * parameter "you" is the stylishness of your clothes, in the range
@@ -45,10 +44,27 @@ public class ProblemSet3 {
 	 * dateFashion(5, 2) → NO
 	 * dateFashion(5, 5) → MAYBE
 	 */
-	
+	}
 	public void dateFashion(int you, int date) {
+		if (you <= 2 || date <= 2)
+		{
+			System.out.println("NO");
+		}
+		else if (you >= 8 && date > 2 )
+		{
+			System.out.println("YES");
+		}
+		else if (you > 2 && date >= 8)
+		{
+			System.out.println("YES");
+		}
+		else if (you > 2 && you < 8 && date > 2 && date < 8 )
+		{
+			System.out.println("MAYBE");
+		}
 		
 	}
+	
 	
 	/*
 	 * Given a string str, if the string starts with "f" print FIZZ.
@@ -62,7 +78,11 @@ public class ProblemSet3 {
 	 */
 	
 	public void fizzString(String str) {
+		System.out.println(str);
 		
+		{
+			System.out.println("FIZZ");
+		}
 	}
 	
 	/*
