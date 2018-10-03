@@ -29,6 +29,7 @@ public class ProblemSet3 {
 		ProblemSet3 ps3 = new ProblemSet3();
 		ps3.dateFashion(5,10);
 		ps3.fizzString("fig");
+		ps3.squirrelPlay(95, false);
 	/*
 	 * You and your date are trying to get a table at a restaurant. The
 	 * parameter "you" is the stylishness of your clothes, in the range
@@ -78,11 +79,18 @@ public class ProblemSet3 {
 	 */
 	
 	public void fizzString(String str) {
-		System.out.println(str);
-		
+		switch (str)
 		{
+		case "fig":
 			System.out.println("FIZZ");
+			break;
+		case "dib":
+			System.out.println("BUZZ");
+		case "fib":
+			System.out.println("FIZZBUZZ");
 		}
+		
+		
 	}
 	
 	/*
@@ -98,7 +106,25 @@ public class ProblemSet3 {
 	 */
 	
 	public void squirrelPlay(int temp, boolean isSummer) {
-		
+		if (isSummer == true)
+		{
+			if (temp > 60 && temp < 100)
+			{
+				System.out.println("YES");
+			}
+		}
+		else if (isSummer == false)
+		{
+			if (temp > 60 && temp < 90)
+			{
+				System.out.println("NO");
+			}
+		}
+		else if (isSummer == false)
+		{
+			System.out.println("NO");
+		}
+			
 	}
 	
 	/*
