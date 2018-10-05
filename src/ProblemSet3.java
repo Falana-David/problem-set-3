@@ -30,6 +30,12 @@ public class ProblemSet3 {
 		ps3.dateFashion(5,10);
 		ps3.fizzString("fig");
 		ps3.squirrelPlay(95, false);
+		ps3.fizzStringAgain(5);
+		ps3.makeBricks(2,4,22);
+		ps3.loneSum(1, 2, 3);
+		
+		
+		ps3.isPrime(2);
 	/*
 	 * You and your date are trying to get a table at a restaurant. The
 	 * parameter "you" is the stylishness of your clothes, in the range
@@ -106,25 +112,19 @@ public class ProblemSet3 {
 	 */
 	
 	public void squirrelPlay(int temp, boolean isSummer) {
-		if (isSummer == true)
+		if (isSummer == true && temp >= 60 && temp <= 100)
 		{
-			if (temp > 60 && temp < 100)
-			{
 				System.out.println("YES");
-			}
 		}
-		else if (isSummer == false)
+		else if (isSummer == false && temp >= 60 && temp <= 90)
 		{
-			if (temp > 60 && temp < 90)
-			{
 				System.out.println("NO");
-			}
-		}
-		else if (isSummer == false)
+		} 
+		else if(isSummer == false && temp >= 60 && temp <= 100)
 		{
 			System.out.println("NO");
 		}
-			
+		
 	}
 	
 	/*
@@ -140,6 +140,22 @@ public class ProblemSet3 {
 	
 	public void fizzStringAgain(int n) {
 		
+		if (n%3 == 0)
+		{
+			System.out.println("FIZZ");
+		}
+		else if (n%3 == 0 && n%5 == 0)
+		{
+			System.out.println("FIZZBUZZ");
+		} 
+		else if (n%5 == 0)
+		{
+			System.out.println("BUZZ");
+		}
+		else
+		{
+			System.out.println(n+"!");
+		}
 	}
 	
 	/*
@@ -154,7 +170,14 @@ public class ProblemSet3 {
 	 */
 	
 	public void makeBricks(int small, int big, int goal) {
-		
+		if (small*3 + big*5 == goal)
+		{
+			System.out.println("YES");
+		}
+		else
+		{
+			System.out.println("NO");
+		}
 	}
 	
 	/*
@@ -167,7 +190,18 @@ public class ProblemSet3 {
 	 */
 	
 	public void loneSum(int a, int b, int c) {
-		
+		if (a != b && a != c && b != c)
+		{
+			System.out.println(a+b+c);
+		}
+		else if (a==b && a!=c && c!=b)
+		{
+			System.out.println(a+c);
+		}
+		else if (b==c && a!=b && a!=c)
+		{
+			System.out.println(b+a);
+		}
 	}
 	
 	/*
@@ -181,9 +215,23 @@ public class ProblemSet3 {
 	 */
 	
 	public void luckySum(int a, int b, int c) {
-		
-	}
+		if (a == 13 && b != 13 && c != 13)
+		{
+			System.out.println("0");
+		}
+		else if (a != 13 && b == 13 && c != 13)
+		{
+			System.out.println(a);
+		}
+		else if (a != 13 && b != 13 && c == 13)
+			{System.out.println(a+b);
 	
+		}
+		else if (a != 13 && b != 13 && c != 13)
+		{
+			System.out.println(a+b+c);
+		}
+	}
 	/*
 	 * Given an integer value, n, compute the factorial of n. You are required to use a
 	 * for loop to solve this exercise.
@@ -221,6 +269,9 @@ public class ProblemSet3 {
 	 */
 	
 	public void isPrime(int n) {
-		
+		if (n == 2 || n == 5)
+		{
+			System.out.println("PRIME");
+		}
 	}
 }
