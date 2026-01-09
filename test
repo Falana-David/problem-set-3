@@ -1,0 +1,296 @@
+# LingoGPTConnector/config.py
+
+class Config:
+    ...
+    def get_realtime_config(self):
+        """
+        Realtime voice config. Mirrors get_gpt_4o_config, but includes websocket path + optional headers.
+        """
+        base = self.get_gpt_4o_config()
+
+        # Optional env overrides (safe defaults)
+        base["realtime_ws_path"] = os.getenv("LINGO_REALTIME_WS_PATH", "openai/realtime")
+        base["realtime_api_version"] = os.getenv(
+            "LINGO_REALTIME_API_VERSION",
+            base["api_version"],  # fall back to 4o api_version
+        )
+
+        # Optional: if your gateway needs these (like your working sample)
+        base["x_upstream_env"] = os.getenv("LINGO_UPSTREAM_ENV", None)
+        base["project_id"] = os.getenv("LINGO_OPENAI_PROJECT_ID", base.get("project_id"))
+
+        return base
+
+
+
+# LingoGPTConnector/realtime_voice.py
+
+from __future__ import annotations
+import asyncio
+import base64
+import json
+import ssl
+from dataclasses import dataclass, field
+from typing import AsyncIterator, Dict, Optional, Iterable, Any
+
+import aiohttp
+
+from LingoGPTConnector.config import Config
+
+
+@dataclass
+class RealtimeSessionParams:
+    # Session defaults (can be overridden per call)
+    voice: str = "alloy"
+    input_audio_format: str = "pcm16"
+    output_audio_format: str = "pcm16"
+
+    # Server VAD vs push-to-talk
+    # - "server_vad" => server commits automatically
+    # - None => caller commits manually
+    turn_detection: Optional[Dict[str, Any]] = None  # e.g. {"type": "server_vad"}
+
+    # Optional transcription of user audio (if supported in your deployment)
+    # Example shape per docs: {"model": "<deployment or model>"}
+    input_audio_transcription: Optional[Dict[str, Any]] = None
+
+    # Extra session fields if you need them later
+    extra_session: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RealtimeResponseParams:
+    modalities: list[str] = field(default_factory=lambda: ["text", "audio"])
+    instructions: Optional[str] = None
+    extra_response: Dict[str, Any] = field(default_factory=dict)
+
+
+class RealtimeVoiceClient:
+    """
+    WebSocket Realtime Voice client suitable for package usage.
+    """
+
+    def __init__(self, config: Config, ssl_verify: bool = True):
+        self.config = config
+        self.ssl_verify = ssl_verify
+
+        if not ssl_verify:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            self._ssl_context = ctx
+        else:
+            self._ssl_context = None
+
+    def _to_ws_base_url(self, https_url: str) -> str:
+        # Convert https://... to wss://...
+        if https_url.startswith("https://"):
+            return "wss://" + https_url[len("https://") :]
+        if https_url.startswith("http://"):
+            return "ws://" + https_url[len("http://") :]
+        # already ws(s)
+        return https_url
+
+    def _build_headers(self, cfg: dict) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+
+        if cfg["resource_flag"] == "KEY":
+            # Direct Azure OpenAI commonly uses api-key header
+            # (Your gateway may differ, but you can override with extra headers if needed.)
+            api_key = cfg.get("api_key")
+            if not api_key:
+                raise ValueError("Realtime requires api_key when resource_flag == 'KEY'")
+            headers["api-key"] = api_key
+        else:
+            # TOKEN mode uses bearer token provider + projectId (like your gateway usage)
+            token = self.config.get_openai_token()
+            headers["Authorization"] = f"Bearer {token}"
+            project_id = cfg.get("project_id")
+            if project_id:
+                headers["projectId"] = str(project_id)
+
+        # Optional gateway header (your working example used x-upstream-env)
+        if cfg.get("x_upstream_env"):
+            headers["x-upstream-env"] = str(cfg["x_upstream_env"])
+
+        return headers
+
+    async def connect(
+        self,
+        *,
+        deployment: Optional[str] = None,
+        session_params: Optional[RealtimeSessionParams] = None,
+        response_params: Optional[RealtimeResponseParams] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+        extra_query: Optional[Dict[str, str]] = None,
+    ) -> "RealtimeConnection":
+        cfg = self.config.get_realtime_config()
+
+        deployment_id = deployment or cfg.get("deployment")
+        if not deployment_id:
+            raise ValueError("Realtime deployment is missing (config.deployment).")
+
+        api_version = cfg.get("realtime_api_version") or cfg.get("api_version")
+        if not api_version:
+            raise ValueError("Realtime api_version is missing.")
+
+        api_url = cfg.get("api_url")
+        if not api_url:
+            raise ValueError("Realtime api_url is missing.")
+
+        ws_base = self._to_ws_base_url(api_url).rstrip("/") + "/"
+        ws_path = cfg.get("realtime_ws_path", "openai/realtime").lstrip("/")
+
+        headers = self._build_headers(cfg)
+        if extra_headers:
+            headers.update(extra_headers)
+
+        params = {
+            "deployment": deployment_id,
+            "api-version": api_version,
+        }
+        if extra_query:
+            params.update(extra_query)
+
+        sess = session_params or RealtimeSessionParams(turn_detection={"type": "server_vad"})
+        resp = response_params or RealtimeResponseParams()
+
+        http_session = aiohttp.ClientSession(base_url=ws_base)
+        ws = await http_session.ws_connect(
+            ws_path,
+            headers=headers,
+            params=params,
+            ssl=self._ssl_context,
+            heartbeat=30,
+        )
+
+        conn = RealtimeConnection(
+            http_session=http_session,
+            ws=ws,
+            session_params=sess,
+            response_params=resp,
+        )
+
+        # Apply session.update before any audio
+        await conn.session_update()
+        return conn
+
+
+class RealtimeConnection:
+    def __init__(
+        self,
+        *,
+        http_session: aiohttp.ClientSession,
+        ws: aiohttp.ClientWebSocketResponse,
+        session_params: RealtimeSessionParams,
+        response_params: RealtimeResponseParams,
+    ):
+        self.http_session = http_session
+        self.ws = ws
+        self.session_params = session_params
+        self.response_params = response_params
+
+    async def close(self):
+        try:
+            await self.ws.close()
+        finally:
+            await self.http_session.close()
+
+    async def send_event(self, event: Dict[str, Any]) -> None:
+        await self.ws.send_str(json.dumps(event))
+
+    async def session_update(self) -> None:
+        session_obj: Dict[str, Any] = {
+            "turn_detection": self.session_params.turn_detection,
+            "voice": self.session_params.voice,
+            "input_audio_format": self.session_params.input_audio_format,
+            "output_audio_format": self.session_params.output_audio_format,
+        }
+        if self.session_params.input_audio_transcription:
+            session_obj["input_audio_transcription"] = self.session_params.input_audio_transcription
+        if self.session_params.extra_session:
+            session_obj.update(self.session_params.extra_session)
+
+        await self.send_event({"type": "session.update", "session": session_obj})
+
+    async def input_audio_append(self, pcm_bytes: bytes) -> None:
+        # input_audio_buffer.append requires base64 audio bytes. :contentReference[oaicite:2]{index=2}
+        await self.send_event(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(pcm_bytes).decode("utf-8"),
+            }
+        )
+
+    async def input_audio_commit(self) -> None:
+        # input_audio_buffer.commit creates a user audio message in conversation. :contentReference[oaicite:3]{index=3}
+        await self.send_event({"type": "input_audio_buffer.commit"})
+
+    async def response_create(self, *, override: Optional[RealtimeResponseParams] = None) -> None:
+        rp = override or self.response_params
+        resp_obj: Dict[str, Any] = {
+            "modalities": rp.modalities,
+        }
+        if rp.instructions:
+            resp_obj["instructions"] = rp.instructions
+        if rp.extra_response:
+            resp_obj.update(rp.extra_response)
+
+        # response.create instructs server to generate. :contentReference[oaicite:4]{index=4}
+        await self.send_event({"type": "response.create", "response": resp_obj})
+
+    async def iter_events(self) -> AsyncIterator[Dict[str, Any]]:
+        while True:
+            msg = await self.ws.receive()
+            if msg.type == aiohttp.WSMsgType.CLOSED:
+                break
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                continue
+            yield json.loads(msg.data)
+
+    async def iter_audio_deltas(self) -> AsyncIterator[bytes]:
+        """
+        Convenience: yields decoded bytes from response.audio.delta until response.audio.done.
+        """
+        async for event in self.iter_events():
+            t = event.get("type")
+            if t == "response.audio.delta":
+                yield base64.b64decode(event["delta"])
+            elif t == "response.audio.done":
+                return
+            elif t == "error":
+                raise RuntimeError(event)
+
+
+# inside GPTClient class (e.g., in client.py)
+
+from LingoGPTConnector.realtime_voice import RealtimeVoiceClient, RealtimeSessionParams, RealtimeResponseParams
+
+async def realtime_voice_connect(
+    self,
+    *,
+    deployment: str | None = None,
+    voice: str = "alloy",
+    server_vad: bool = True,
+    input_audio_format: str = "pcm16",
+    output_audio_format: str = "pcm16",
+    instructions: str | None = None,
+    extra_session: dict | None = None,
+    extra_response: dict | None = None,
+):
+    rtc = RealtimeVoiceClient(self.config, ssl_verify=True)
+
+    td = {"type": "server_vad"} if server_vad else None
+    sess = RealtimeSessionParams(
+        voice=voice,
+        input_audio_format=input_audio_format,
+        output_audio_format=output_audio_format,
+        turn_detection=td,
+        extra_session=extra_session or {},
+    )
+    resp = RealtimeResponseParams(
+        modalities=["text", "audio"],
+        instructions=instructions,
+        extra_response=extra_response or {},
+    )
+    return await rtc.connect(deployment=deployment, session_params=sess, response_params=resp)
