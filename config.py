@@ -49,8 +49,12 @@ class Config:
             )
 
         # Realtime (WebSocket) config
-        self.openai_realtime_version = os.getenv("LINGO_REALTIME_API_VERSION", "2024-10-01-preview")
+        self.openai_realtime_version = os.getenv("LINGO_REALTIME_API_VERSION", "2025-04-01-preview")
         self.openai_realtime_deployment = os.getenv("LINGO_REALTIME_DEPLOYMENT", None)
+        # Custom WebSocket path for enterprise gateways (e.g., "openai/realtime" or just "realtime")
+        self.openai_realtime_ws_path = os.getenv("LINGO_REALTIME_WS_PATH", "openai/realtime")
+        # Environment header for enterprise gateways (e.g., "prod", "dev")
+        self.openai_upstream_env = os.getenv("LINGO_UPSTREAM_ENV", None)
 
     def get_openai_token(self):
         """Get or refresh OAuth token for TOKEN authentication mode."""
@@ -155,11 +159,16 @@ class Config:
             "api_url": self.openai_api_url,
             "api_version": self.openai_realtime_version,
             "deployment": self.openai_realtime_deployment,
+            "ws_path": self.openai_realtime_ws_path,
         }
 
         if self.resource_flag == "KEY":
             cfg["api_key"] = self.openai_api_key
         else:
             cfg["project_id"] = self.openai_project_id
+
+        # Enterprise gateway headers
+        if self.openai_upstream_env:
+            cfg["x_upstream_env"] = self.openai_upstream_env
 
         return cfg
