@@ -1,13 +1,7 @@
-# streamlit_app.py
-#
-# Streamlit app:
-# 1) Record audio from browser mic (st.audio_input)
-# 2) Send it to your LingoGPTConnector realtime websocket (push-to-talk)
-# 3) Receive assistant audio stream and return as a WAV file (download + playback)
-
 import asyncio
 import base64
 import io
+import json
 import wave
 from datetime import datetime
 
@@ -15,15 +9,13 @@ import numpy as np
 import streamlit as st
 
 from LingoGPTConnector.config import Config
-from LingoGPTConnector.client import GPTClient
+from LingoGPTConnector.realtime_voice import RealtimeVoiceClient, RealtimeSessionParams, RealtimeResponseParams
 
 
 # ----------------------------
-# Utilities
+# Async runner for Streamlit
 # ----------------------------
-
 def run_async(coro):
-    """Run an async coroutine from Streamlit's sync context."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -35,42 +27,52 @@ def run_async(coro):
             return new_loop.run_until_complete(coro)
         finally:
             new_loop.close()
+    return asyncio.run(coro)
+
+
+# ----------------------------
+# Audio helpers
+# ----------------------------
+def wav_bytes_to_pcm16_mono(wav_bytes: bytes) -> tuple[np.ndarray, int]:
+    """Return (mono_samples_int16, sample_rate) from 16-bit PCM WAV."""
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        ch = wf.getnchannels()
+        sw = wf.getsampwidth()
+        sr = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+
+    if sw != 2:
+        raise ValueError(f"Expected 16-bit PCM WAV. Got sampwidth={sw}.")
+
+    samples = np.frombuffer(frames, dtype=np.int16)
+
+    if ch == 1:
+        mono = samples
+    elif ch == 2:
+        mono = samples.reshape(-1, 2).mean(axis=1).astype(np.int16)
     else:
-        return asyncio.run(coro)
+        raise ValueError(f"Unsupported channels={ch} (expected 1 or 2).")
+
+    return mono, sr
 
 
-def wav_bytes_to_pcm16_mono(wav_bytes: bytes) -> tuple[bytes, int]:
-    """
-    Decode a WAV file and return (pcm16_mono_bytes, sample_rate).
-    If stereo, downmix to mono by averaging channels.
-    Requires 16-bit PCM WAV.
-    """
-    bio = io.BytesIO(wav_bytes)
-    with wave.open(bio, "rb") as wf:
-        channels = wf.getnchannels()
-        sampwidth = wf.getsampwidth()
-        sample_rate = wf.getframerate()
-        nframes = wf.getnframes()
-        frames = wf.readframes(nframes)
+def resample_linear_int16(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    """Simple linear resample (good enough for voice)."""
+    if src_sr == dst_sr:
+        return x
 
-    if sampwidth != 2:
-        raise ValueError(f"Expected 16-bit PCM WAV. Got sampwidth={sampwidth}.")
+    x_f = x.astype(np.float32)
+    src_n = len(x_f)
+    dst_n = int(round(src_n * (dst_sr / src_sr)))
 
-    audio = np.frombuffer(frames, dtype=np.int16)
+    src_idx = np.arange(src_n, dtype=np.float32)
+    dst_idx = np.linspace(0, src_n - 1, dst_n, dtype=np.float32)
 
-    if channels == 1:
-        mono = audio
-    elif channels == 2:
-        stereo = audio.reshape(-1, 2)
-        mono = stereo.mean(axis=1).astype(np.int16)
-    else:
-        raise ValueError(f"Unsupported channel count: {channels} (expected 1 or 2).")
-
-    return mono.tobytes(), sample_rate
+    y = np.interp(dst_idx, src_idx, x_f)
+    return np.clip(np.round(y), -32768, 32767).astype(np.int16)
 
 
 def pcm16_to_wav_bytes(pcm16: bytes, sample_rate: int, channels: int = 1) -> bytes:
-    """Wrap raw PCM16 bytes into a WAV container."""
     bio = io.BytesIO()
     with wave.open(bio, "wb") as wf:
         wf.setnchannels(channels)
@@ -80,155 +82,153 @@ def pcm16_to_wav_bytes(pcm16: bytes, sample_rate: int, channels: int = 1) -> byt
     return bio.getvalue()
 
 
-async def realtime_roundtrip_wav(
+# ----------------------------
+# Realtime roundtrip
+# ----------------------------
+async def realtime_roundtrip(
+    user_pcm16: bytes,
     *,
-    user_pcm16_mono: bytes,
-    user_sample_rate: int,
-    instructions: str | None,
-    voice: str,
-    output_sample_rate: int,
+    input_sr: int = 24000,
+    output_sr: int = 24000,
+    voice: str = "alloy",
+    instructions: str | None = None,
     chunk_ms: int = 100,
-) -> tuple[bytes, str | None]:
-    """
-    Push-to-talk flow:
-    - connect
-    - append audio chunks
-    - commit
-    - response.create
-    - collect response.audio.delta -> PCM16 bytes
-    - return WAV bytes + transcript (if available)
-    """
+    show_debug: bool = False,
+):
+    cfg = Config()
+    rtc = RealtimeVoiceClient(cfg, ssl_verify=True)
 
-    config = Config()
-    gpt = GPTClient(config)
-
-    # Push-to-talk is best for Streamlit (record then send).
-    conn = await gpt.realtime_voice(
+    # Tell the session what sample rate we are sending.
+    session_params = RealtimeSessionParams(
         voice=voice,
-        server_vad=False,
+        input_audio_format="pcm16",
+        output_audio_format="pcm16",
+        turn_detection=None,  # push-to-talk
+        extra_session={
+            "input_audio_sampling_rate": input_sr,
+        },
+    )
+
+    response_params = RealtimeResponseParams(
+        modalities=["text", "audio"],
         instructions=instructions,
     )
 
-    assistant_pcm = bytearray()
-    transcript = None
+    conn = await rtc.connect(session_params=session_params, response_params=response_params)
 
-    # chunk size in bytes for mono pcm16:
-    # bytes_per_ms = sample_rate * 2 bytes / 1000
-    bytes_per_ms = int(user_sample_rate * 2 / 1000)
-    chunk_bytes = max(320, bytes_per_ms * chunk_ms)  # floor to avoid tiny chunks
+    assistant_audio = bytearray()
+    transcript = None
+    debug_events = []
+
+    bytes_per_ms = int(input_sr * 2 / 1000)  # mono pcm16
+    chunk_bytes = max(640, bytes_per_ms * chunk_ms)
 
     try:
-        # Stream user's audio up
-        for i in range(0, len(user_pcm16_mono), chunk_bytes):
-            await conn.input_audio_append(user_pcm16_mono[i : i + chunk_bytes])
+        for i in range(0, len(user_pcm16), chunk_bytes):
+            await conn.input_audio_append(user_pcm16[i : i + chunk_bytes])
 
         await conn.input_audio_commit()
         await conn.response_create()
 
-        # Read events until response.done, collecting audio deltas
         async for event in conn.iter_events():
-            t = event.get("type")
+            et = event.get("type")
 
-            if t == "response.audio.delta":
-                assistant_pcm.extend(base64.b64decode(event["delta"]))
+            if show_debug:
+                # keep last ~40 events
+                debug_events.append(event)
+                if len(debug_events) > 40:
+                    debug_events.pop(0)
 
-            elif t == "response.audio.done":
-                # audio finished; wait for response.done to capture transcript if present
-                pass
+            if et == "response.audio.delta":
+                # audio chunk is base64 in event["delta"]
+                assistant_audio.extend(base64.b64decode(event["delta"]))
 
-            elif t == "response.done":
-                # transcript may be present depending on your response structure
+            elif et == "response.done":
+                # transcript might be present depending on server output shape
                 try:
                     transcript = event["response"]["output"][0]["content"][0].get("transcript")
                 except Exception:
                     transcript = None
                 break
 
-            elif t == "error":
+            elif et == "error":
                 raise RuntimeError(event)
 
     finally:
         await conn.close()
 
-    assistant_wav = pcm16_to_wav_bytes(bytes(assistant_pcm), sample_rate=output_sample_rate, channels=1)
-    return assistant_wav, transcript
+    # Wrap assistant audio into WAV at output_sr
+    assistant_wav = pcm16_to_wav_bytes(bytes(assistant_audio), sample_rate=output_sr, channels=1)
+    return assistant_wav, transcript, debug_events
 
 
 # ----------------------------
-# Streamlit UI
+# UI
 # ----------------------------
-
-st.set_page_config(page_title="Lingo Realtime Voice", layout="centered")
-st.title("Lingo Realtime Voice (Mic → WAV reply)")
-
-st.markdown(
-    """
-Record a short message with your mic, send it to the realtime model via websockets,
-and receive the assistant's audio reply as a WAV file.
-"""
-)
+st.set_page_config(page_title="Realtime Voice (Lingo)", layout="centered")
+st.title("Realtime Voice (Mic → WAV reply)")
 
 with st.expander("Settings", expanded=True):
     voice = st.selectbox("Voice", ["alloy", "verse", "aria", "sage", "ember", "coral"], index=0)
-    instructions = st.text_area(
-        "Instructions (optional)",
-        value="Answer clearly and briefly.",
-        height=80,
-    )
+    instructions = st.text_area("Instructions", value="Answer clearly and briefly.", height=80)
+    debug = st.checkbox("Show debug events", value=True)
 
-    # Output sample rate is environment/model dependent.
-    # Many setups default to 24000 for pcm16 output; adjust if your deployment uses a different rate.
-    output_sample_rate = st.selectbox("Assistant output sample rate (WAV)", [24000, 16000, 48000], index=0)
+st.info("Record, then click **Send**. This uses push-to-talk (manual commit).")
 
-audio_file = st.audio_input("Record your question (browser mic)", sample_rate=16000)
+audio_file = st.audio_input("Record your question", sample_rate=16000)
 
 if audio_file is not None:
-    user_wav_bytes = audio_file.read()
-    st.markdown("### Your recording")
-    st.audio(user_wav_bytes, format="audio/wav")
+    user_wav = audio_file.read()
+    st.audio(user_wav, format="audio/wav")
 
-    if st.button("Send to realtime model"):
+    if st.button("Send"):
         try:
-            user_pcm16_mono, user_sr = wav_bytes_to_pcm16_mono(user_wav_bytes)
+            user_mono, user_sr = wav_bytes_to_pcm16_mono(user_wav)
 
-            if user_sr != 16000:
-                st.warning(
-                    f"Your recording sample rate is {user_sr} Hz. "
-                    "This app will still send it, but best results are usually at 16000 Hz."
-                )
+            # Resample to 24kHz mono PCM16 (recommended for realtime pcm16 defaults)
+            target_sr = 24000
+            user_24k = resample_linear_int16(user_mono, user_sr, target_sr)
+            user_pcm_bytes = user_24k.tobytes()
 
-            with st.spinner("Streaming audio to the model and waiting for reply..."):
-                assistant_wav, transcript = run_async(
-                    realtime_roundtrip_wav(
-                        user_pcm16_mono=user_pcm16_mono,
-                        user_sample_rate=user_sr,
-                        instructions=instructions.strip() or None,
+            with st.spinner("Streaming to model..."):
+                assistant_wav, transcript, debug_events = run_async(
+                    realtime_roundtrip(
+                        user_pcm_bytes,
+                        input_sr=target_sr,
+                        output_sr=24000,
                         voice=voice,
-                        output_sample_rate=output_sample_rate,
+                        instructions=instructions.strip() or None,
+                        show_debug=debug,
                     )
                 )
 
-            st.success("Got an audio reply!")
+            # Check for empty audio
+            if len(assistant_wav) <= 44:  # WAV header is 44 bytes; <=44 => no frames
+                st.error("Got response, but assistant audio was empty (no response.audio.delta).")
+                if debug and debug_events:
+                    st.subheader("Last events (debug)")
+                    st.code(json.dumps(debug_events, indent=2)[:12000])
+            else:
+                st.success("Got an audio reply!")
 
-            if transcript:
-                st.markdown("### Transcript")
-                st.write(transcript)
+                if transcript:
+                    st.subheader("Transcript")
+                    st.write(transcript)
 
-            st.markdown("### Assistant reply (WAV)")
-            st.audio(assistant_wav, format="audio/wav")
+                st.subheader("Assistant reply")
+                st.audio(assistant_wav, format="audio/wav")
 
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"assistant_reply_{ts}.wav"
-            st.download_button(
-                "Download WAV",
-                data=assistant_wav,
-                file_name=filename,
-                mime="audio/wav",
-            )
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                st.download_button(
+                    "Download WAV",
+                    data=assistant_wav,
+                    file_name=f"assistant_reply_{ts}.wav",
+                    mime="audio/wav",
+                )
+
+                if debug:
+                    st.subheader("Last events (debug)")
+                    st.code(json.dumps(debug_events, indent=2)[:12000])
 
         except Exception as e:
             st.error(f"Error: {e}")
-
-st.caption(
-    "Note: Ensure your env vars are set for realtime (LINGO_REALTIME_DEPLOYMENT, LINGO_REALTIME_API_VERSION, etc.)."
-)
