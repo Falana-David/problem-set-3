@@ -54,7 +54,8 @@ class RealtimeVoiceClient:
         """
         Build the complete WebSocket URL for Azure OpenAI Realtime API.
 
-        Format: wss://{resource}.openai.azure.com/openai/realtime?api-version={version}&deployment={deployment}
+        Standard format: wss://{resource}.openai.azure.com/openai/realtime?api-version={version}&deployment={deployment}
+        Enterprise gateways may use custom paths via LINGO_REALTIME_WS_PATH env var.
         """
         api_url = cfg.get("api_url", "")
 
@@ -69,6 +70,9 @@ class RealtimeVoiceClient:
         # Ensure no trailing slash
         ws_base = ws_base.rstrip("/")
 
+        # Get custom WebSocket path (default: "openai/realtime")
+        ws_path = cfg.get("ws_path", "openai/realtime").strip("/")
+
         # Build query parameters
         params = {
             "api-version": cfg.get("api_version"),
@@ -77,8 +81,8 @@ class RealtimeVoiceClient:
         query_string = urlencode(params)
 
         # Construct full URL
-        ws_url = f"{ws_base}/openai/realtime?{query_string}"
-        logger.debug(f"Built WebSocket URL: {ws_url}")
+        ws_url = f"{ws_base}/{ws_path}?{query_string}"
+        logger.info(f"Built WebSocket URL: {ws_url}")
         return ws_url
 
     def _build_headers(self, cfg: dict) -> Dict[str, str]:
@@ -99,6 +103,11 @@ class RealtimeVoiceClient:
             if project_id:
                 headers["projectId"] = str(project_id)
 
+        # Enterprise gateway: x-upstream-env header (e.g., "prod", "dev")
+        x_upstream_env = cfg.get("x_upstream_env")
+        if x_upstream_env:
+            headers["x-upstream-env"] = str(x_upstream_env)
+
         return headers
 
     async def connect(
@@ -106,12 +115,20 @@ class RealtimeVoiceClient:
         *,
         session_params: Optional[RealtimeSessionParams] = None,
         response_params: Optional[RealtimeResponseParams] = None,
+        connect_timeout: float = 30.0,
     ) -> "RealtimeConnection":
         """
         Establish a WebSocket connection to the Realtime API.
 
+        Args:
+            session_params: Configuration for the session
+            response_params: Configuration for responses
+            connect_timeout: Timeout in seconds for connection (default 30s)
+
         Returns a RealtimeConnection that can be used to send/receive events.
         """
+        import asyncio
+
         cfg = self.config.get_realtime_config()
 
         # Validate required config
@@ -122,21 +139,58 @@ class RealtimeVoiceClient:
         if not cfg.get("api_version"):
             raise ValueError("Realtime: api_version missing in config.")
 
-        # Build the full WebSocket URL
-        ws_url = self._build_ws_url(cfg)
+        # Build base URL (convert https to wss)
+        api_url = cfg.get("api_url", "")
+        if api_url.startswith("https://"):
+            ws_base = "wss://" + api_url[len("https://"):]
+        elif api_url.startswith("http://"):
+            ws_base = "ws://" + api_url[len("http://"):]
+        else:
+            ws_base = api_url
+        ws_base = ws_base.rstrip("/") + "/"
+
+        # Get WebSocket path
+        ws_path = cfg.get("ws_path", "openai/realtime").strip("/")
+
+        # Build query parameters
+        params = {
+            "deployment": cfg.get("deployment"),
+            "api-version": cfg.get("api_version"),
+        }
+
         headers = self._build_headers(cfg)
 
-        logger.info(f"Connecting to Realtime API at: {ws_url}")
+        logger.info(f"Connecting to Realtime API...")
+        logger.info(f"Base URL: {ws_base}")
+        logger.info(f"Path: {ws_path}")
+        logger.info(f"Params: {params}")
+        logger.info(f"Headers: {list(headers.keys())}")
 
-        # Create HTTP session and connect
-        http_session = aiohttp.ClientSession()
+        # Create HTTP session with base_url (matches company sample code pattern)
+        http_session = aiohttp.ClientSession(base_url=ws_base)
         try:
-            ws = await http_session.ws_connect(
-                ws_url,
-                headers=headers,
-                ssl=self._ssl_context,
-                heartbeat=30,
+            logger.info(f"Attempting WebSocket connection (timeout: {connect_timeout}s)...")
+            ws = await asyncio.wait_for(
+                http_session.ws_connect(
+                    ws_path,
+                    headers=headers,
+                    params=params,
+                    ssl=self._ssl_context,
+                    heartbeat=30,
+                    timeout=aiohttp.ClientTimeout(total=connect_timeout),
+                ),
+                timeout=connect_timeout,
             )
+            logger.info("WebSocket connection established!")
+        except asyncio.TimeoutError:
+            await http_session.close()
+            raise RuntimeError(
+                f"Connection timed out after {connect_timeout}s. "
+                "Check if the endpoint supports WebSocket connections and the URL is correct."
+            )
+        except aiohttp.ClientError as e:
+            await http_session.close()
+            raise RuntimeError(f"WebSocket connection failed: {e}") from e
         except Exception as e:
             await http_session.close()
             raise RuntimeError(f"Failed to connect to Realtime API: {e}") from e
@@ -148,19 +202,30 @@ class RealtimeVoiceClient:
             response_params=response_params or RealtimeResponseParams(),
         )
 
-        # Wait for session.created event
+        # Wait for session.created event with timeout
         logger.info("Waiting for session.created event...")
-        async for event in conn.iter_events():
-            event_type = event.get("type")
-            logger.debug(f"Received event: {event_type}")
-            if event_type == "session.created":
-                logger.info("Session created successfully")
-                break
-            elif event_type == "error":
-                raise RuntimeError(f"Error during session creation: {event}")
+        try:
+            async with asyncio.timeout(connect_timeout):
+                async for event in conn.iter_events():
+                    event_type = event.get("type")
+                    logger.info(f"Received event: {event_type}")
+                    if event_type == "session.created":
+                        logger.info("Session created successfully!")
+                        break
+                    elif event_type == "error":
+                        error_msg = event.get("error", {}).get("message", str(event))
+                        raise RuntimeError(f"Server error during session creation: {error_msg}")
+        except asyncio.TimeoutError:
+            await conn.close()
+            raise RuntimeError(
+                f"Timed out waiting for session.created event after {connect_timeout}s. "
+                "The server may not support the Realtime API or the deployment name is incorrect."
+            )
 
         # Send session.update to configure the session
+        logger.info("Sending session.update...")
         await conn.session_update()
+        logger.info("Session configured!")
         return conn
 
 
