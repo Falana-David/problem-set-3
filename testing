@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""
+Test script for Azure OpenAI Realtime Voice API.
+
+This script captures audio from your microphone, sends it to the Realtime API,
+and plays back the audio response through your speakers.
+
+Usage:
+    python -m LingoGPTConnector.test_realtime
+
+Requirements:
+    pip install pyaudio aiohttp python-dotenv
+
+Make sure your .env file has the required variables:
+    OPENAI_RESOURCE_FLAG=KEY
+    LINGO_OPENAI_API_KEY=your-api-key
+    LINGO_OPENAI_API_URL_KEY=https://your-resource.openai.azure.com
+    LINGO_REALTIME_API_VERSION=2024-10-01-preview
+    LINGO_REALTIME_DEPLOYMENT=gpt-4o-realtime-preview
+"""
+
+import asyncio
+import logging
+import sys
+import threading
+import queue
+from typing import Optional
+
+try:
+    import pyaudio
+except ImportError:
+    print("Error: pyaudio is required. Install with: pip install pyaudio")
+    print("On macOS, you may need: brew install portaudio && pip install pyaudio")
+    sys.exit(1)
+
+from LingoGPTConnector.config import Config
+from LingoGPTConnector.client import GPTClient
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# Audio settings - Azure Realtime API expects 24kHz mono PCM16
+SAMPLE_RATE = 24000
+CHANNELS = 1
+CHUNK_SIZE = 4800  # 200ms chunks at 24kHz
+FORMAT = pyaudio.paInt16
+
+
+class AudioPlayer:
+    """Plays audio through speakers in a background thread."""
+
+    def __init__(self):
+        self.audio = pyaudio.PyAudio()
+        self.stream: Optional[pyaudio.Stream] = None
+        self.queue: queue.Queue[Optional[bytes]] = queue.Queue()
+        self.thread: Optional[threading.Thread] = None
+        self.running = False
+
+    def start(self):
+        """Start the audio playback thread."""
+        self.stream = self.audio.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=SAMPLE_RATE,
+            output=True,
+            frames_per_buffer=CHUNK_SIZE,
+        )
+        self.running = True
+        self.thread = threading.Thread(target=self._play_loop, daemon=True)
+        self.thread.start()
+        logger.info("Audio player started")
+
+    def _play_loop(self):
+        """Background thread that plays audio from the queue."""
+        while self.running:
+            try:
+                data = self.queue.get(timeout=0.1)
+                if data is None:
+                    break
+                if self.stream:
+                    self.stream.write(data)
+            except queue.Empty:
+                continue
+
+    def play(self, pcm_bytes: bytes):
+        """Queue audio data for playback."""
+        self.queue.put(pcm_bytes)
+
+    def stop(self):
+        """Stop the audio player."""
+        self.running = False
+        self.queue.put(None)  # Signal to stop
+        if self.thread:
+            self.thread.join(timeout=1.0)
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+        self.audio.terminate()
+        logger.info("Audio player stopped")
+
+
+class MicrophoneCapture:
+    """Captures audio from microphone in a background thread."""
+
+    def __init__(self, audio_queue: asyncio.Queue):
+        self.audio = pyaudio.PyAudio()
+        self.stream: Optional[pyaudio.Stream] = None
+        self.audio_queue = audio_queue
+        self.running = False
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def start(self, loop: asyncio.AbstractEventLoop):
+        """Start capturing audio from the microphone."""
+        self.loop = loop
+        self.stream = self.audio.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=SAMPLE_RATE,
+            input=True,
+            frames_per_buffer=CHUNK_SIZE,
+            stream_callback=self._audio_callback,
+        )
+        self.running = True
+        self.stream.start_stream()
+        logger.info("Microphone capture started - speak into your mic!")
+
+    def _audio_callback(self, in_data, frame_count, time_info, status):
+        """Callback called by PyAudio when audio data is available."""
+        if self.running and self.loop and in_data:
+            # Schedule the coroutine to put data in the async queue
+            asyncio.run_coroutine_threadsafe(
+                self.audio_queue.put(in_data), self.loop
+            )
+        return (None, pyaudio.paContinue)
+
+    def stop(self):
+        """Stop capturing audio."""
+        self.running = False
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+        self.audio.terminate()
+        logger.info("Microphone capture stopped")
+
+
+async def send_audio_task(conn, audio_queue: asyncio.Queue, stop_event: asyncio.Event):
+    """Task that sends microphone audio to the Realtime API."""
+    logger.info("Audio sender task started")
+    try:
+        while not stop_event.is_set():
+            try:
+                # Wait for audio data with timeout
+                pcm_bytes = await asyncio.wait_for(audio_queue.get(), timeout=0.1)
+                await conn.input_audio_append(pcm_bytes)
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"Error sending audio: {e}")
+                break
+    finally:
+        logger.info("Audio sender task stopped")
+
+
+async def receive_events_task(conn, player: AudioPlayer, stop_event: asyncio.Event):
+    """Task that receives events from the Realtime API and plays audio."""
+    logger.info("Event receiver task started")
+
+    transcript_buffer = {"user": "", "assistant": ""}
+
+    try:
+        async for event in conn.iter_events():
+            if stop_event.is_set():
+                break
+
+            event_type = event.get("type", "")
+
+            # Log key events
+            if event_type == "session.updated":
+                logger.info("Session configured successfully")
+
+            elif event_type == "input_audio_buffer.speech_started":
+                logger.info(">>> Speech detected - listening...")
+                transcript_buffer["user"] = ""
+
+            elif event_type == "input_audio_buffer.speech_stopped":
+                logger.info(">>> Speech ended - processing...")
+
+            elif event_type == "response.created":
+                logger.info("<<< Generating response...")
+                transcript_buffer["assistant"] = ""
+
+            elif event_type in ("response.audio.delta", "response.output_audio.delta"):
+                # Play the audio
+                delta = event.get("delta")
+                if delta:
+                    import base64
+                    pcm_bytes = base64.b64decode(delta)
+                    player.play(pcm_bytes)
+
+            elif event_type == "response.audio_transcript.delta":
+                # Accumulate assistant transcript
+                delta = event.get("delta", "")
+                transcript_buffer["assistant"] += delta
+
+            elif event_type == "conversation.item.input_audio_transcription.completed":
+                # User speech transcription
+                transcript = event.get("transcript", "")
+                if transcript:
+                    print(f"\n[You]: {transcript}")
+
+            elif event_type in ("response.audio.done", "response.output_audio.done"):
+                # Print assistant transcript when audio is done
+                if transcript_buffer["assistant"]:
+                    print(f"\n[Assistant]: {transcript_buffer['assistant']}")
+                logger.info("<<< Response complete")
+
+            elif event_type == "response.done":
+                logger.info("Response cycle complete - ready for next input")
+
+            elif event_type == "error":
+                logger.error(f"Server error: {event}")
+                stop_event.set()
+                break
+
+    except Exception as e:
+        logger.error(f"Error in event receiver: {e}")
+        stop_event.set()
+    finally:
+        logger.info("Event receiver task stopped")
+
+
+async def main():
+    """Main function to run the realtime voice test."""
+    print("\n" + "=" * 60)
+    print("Azure OpenAI Realtime Voice Test")
+    print("=" * 60)
+    print("\nThis will capture audio from your microphone and play")
+    print("the assistant's audio response through your speakers.")
+    print("\nPress Ctrl+C to stop.\n")
+
+    # Initialize
+    try:
+        config = Config()
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
+        logger.error("Make sure your .env file is set up correctly.")
+        return
+
+    client = GPTClient(config)
+
+    # Connect to Realtime API
+    logger.info("Connecting to Azure OpenAI Realtime API...")
+    try:
+        conn = await client.realtime_voice(
+            voice="alloy",
+            server_vad=True,
+            instructions="You are a helpful voice assistant. Keep responses concise and conversational.",
+            input_audio_transcription={"model": "whisper-1"},  # Enable transcription
+        )
+    except Exception as e:
+        logger.error(f"Failed to connect: {e}")
+        return
+
+    logger.info("Connected! Session is ready.")
+
+    # Set up audio
+    player = AudioPlayer()
+    player.start()
+
+    audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
+    mic = MicrophoneCapture(audio_queue)
+    mic.start(asyncio.get_event_loop())
+
+    stop_event = asyncio.Event()
+
+    # Create tasks
+    sender_task = asyncio.create_task(send_audio_task(conn, audio_queue, stop_event))
+    receiver_task = asyncio.create_task(receive_events_task(conn, player, stop_event))
+
+    print("\n" + "-" * 60)
+    print("Ready! Speak into your microphone...")
+    print("-" * 60 + "\n")
+
+    try:
+        # Wait for Ctrl+C
+        await asyncio.gather(sender_task, receiver_task)
+    except asyncio.CancelledError:
+        pass
+    except KeyboardInterrupt:
+        logger.info("\nStopping...")
+    finally:
+        stop_event.set()
+
+        # Cancel tasks
+        sender_task.cancel()
+        receiver_task.cancel()
+
+        try:
+            await asyncio.gather(sender_task, receiver_task, return_exceptions=True)
+        except:
+            pass
+
+        # Cleanup
+        mic.stop()
+        player.stop()
+        await conn.close()
+        logger.info("Cleanup complete")
+
+
+async def debug_mode():
+    """
+    Debug mode: connect and print all events without audio playback.
+
+    Useful for diagnosing connection issues.
+    """
+    print("\n" + "=" * 60)
+    print("DEBUG MODE - Printing all events")
+    print("=" * 60 + "\n")
+
+    config = Config()
+    client = GPTClient(config)
+
+    logger.info("Connecting to Realtime API...")
+    conn = await client.realtime_voice(
+        voice="alloy",
+        server_vad=True,
+    )
+    logger.info("Connected!")
+
+    print("\nListening for events (Ctrl+C to stop)...\n")
+
+    try:
+        await conn.debug_print_events(max_events=500)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await conn.close()
+
+
+if __name__ == "__main__":
+    # Check for debug flag
+    if "--debug" in sys.argv:
+        asyncio.run(debug_mode())
+    else:
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            print("\nGoodbye!")
