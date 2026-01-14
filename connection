@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""
+Diagnostic script to test Azure OpenAI Realtime API connection.
+
+Run this to verify your configuration before using the Streamlit app.
+
+Usage:
+    python -m LingoGPTConnector.diagnose
+"""
+
+import asyncio
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from LingoGPTConnector.config import Config
+from LingoGPTConnector.realtime_voice import RealtimeVoiceClient, RealtimeSessionParams, RealtimeResponseParams
+
+
+def check_env():
+    """Check environment variables."""
+    print("\n" + "=" * 60)
+    print("STEP 1: Checking Environment Variables")
+    print("=" * 60)
+
+    required_vars = {
+        "KEY": [
+            "OPENAI_RESOURCE_FLAG",
+            "LINGO_OPENAI_API_KEY",
+            "LINGO_OPENAI_API_URL_KEY",
+            "LINGO_REALTIME_DEPLOYMENT",
+        ],
+        "TOKEN": [
+            "OPENAI_RESOURCE_FLAG",
+            "LINGO_OPENAI_API_URL_TOKEN",
+            "LINGO_REALTIME_DEPLOYMENT",
+            "OPENAI_AUTH_URL",
+            "OPENAI_CLIENT_ID",
+            "OPENAI_CLIENT_SECRET",
+            "OPENAI_SCOPE",
+        ]
+    }
+
+    resource_flag = os.getenv("OPENAI_RESOURCE_FLAG")
+    print(f"\nOPENAI_RESOURCE_FLAG = {resource_flag}")
+
+    if not resource_flag:
+        print("\n❌ ERROR: OPENAI_RESOURCE_FLAG not set!")
+        print("   Set it to 'KEY' or 'TOKEN' in your .env file")
+        return False
+
+    if resource_flag not in ("KEY", "TOKEN"):
+        print(f"\n❌ ERROR: Invalid OPENAI_RESOURCE_FLAG: {resource_flag}")
+        print("   Must be 'KEY' or 'TOKEN'")
+        return False
+
+    print(f"\nChecking required variables for {resource_flag} mode:\n")
+
+    missing = []
+    for var in required_vars[resource_flag]:
+        value = os.getenv(var)
+        if value:
+            # Mask sensitive values
+            if "KEY" in var or "SECRET" in var or "TOKEN" in var:
+                display = value[:8] + "..." + value[-4:] if len(value) > 12 else "***"
+            else:
+                display = value
+            print(f"  ✅ {var} = {display}")
+        else:
+            print(f"  ❌ {var} = NOT SET")
+            missing.append(var)
+
+    # Check optional but important
+    print("\nOptional variables:")
+    api_version = os.getenv("LINGO_REALTIME_API_VERSION", "2024-10-01-preview")
+    print(f"  ℹ️  LINGO_REALTIME_API_VERSION = {api_version}")
+
+    if missing:
+        print(f"\n❌ Missing required variables: {missing}")
+        return False
+
+    print("\n✅ All required environment variables are set!")
+    return True
+
+
+def check_config():
+    """Check Config class loads correctly."""
+    print("\n" + "=" * 60)
+    print("STEP 2: Loading Configuration")
+    print("=" * 60)
+
+    try:
+        config = Config()
+        print(f"\n✅ Config loaded successfully!")
+        print(f"   Resource flag: {config.resource_flag}")
+        print(f"   API URL: {config.openai_api_url}")
+        print(f"   Realtime deployment: {config.openai_realtime_deployment}")
+        print(f"   Realtime API version: {config.openai_realtime_version}")
+        return config
+    except Exception as e:
+        print(f"\n❌ Config failed to load: {e}")
+        return None
+
+
+def check_realtime_config(config):
+    """Check realtime config specifically."""
+    print("\n" + "=" * 60)
+    print("STEP 3: Checking Realtime Configuration")
+    print("=" * 60)
+
+    try:
+        rt_config = config.get_realtime_config()
+        print("\n✅ Realtime config loaded:")
+        for key, value in rt_config.items():
+            if "key" in key.lower():
+                display = value[:8] + "..." if value and len(value) > 8 else "***"
+            else:
+                display = value
+            print(f"   {key}: {display}")
+        return rt_config
+    except Exception as e:
+        print(f"\n❌ Realtime config error: {e}")
+        return None
+
+
+async def test_connection(config):
+    """Test actual WebSocket connection."""
+    print("\n" + "=" * 60)
+    print("STEP 4: Testing WebSocket Connection")
+    print("=" * 60)
+
+    client = RealtimeVoiceClient(config, ssl_verify=True)
+
+    # Build URL for display
+    rt_config = config.get_realtime_config()
+    api_url = rt_config.get("api_url", "")
+    if api_url.startswith("https://"):
+        ws_url = "wss://" + api_url[len("https://"):]
+    else:
+        ws_url = api_url
+    ws_url = ws_url.rstrip("/")
+    ws_url = f"{ws_url}/openai/realtime?api-version={rt_config['api_version']}&deployment={rt_config['deployment']}"
+
+    print(f"\nConnecting to: {ws_url}")
+    print("(This may take a few seconds...)\n")
+
+    try:
+        session_params = RealtimeSessionParams(
+            voice="alloy",
+            turn_detection={"type": "server_vad"},
+        )
+        response_params = RealtimeResponseParams(
+            modalities=["text", "audio"],
+        )
+
+        conn = await client.connect(
+            session_params=session_params,
+            response_params=response_params,
+        )
+
+        print("✅ Connection established!")
+        print("✅ Session created!")
+        print("✅ Session configured with modalities: ['text', 'audio']")
+
+        # Listen for a few events
+        print("\nListening for events (5 seconds)...\n")
+
+        import asyncio
+        try:
+            async with asyncio.timeout(5):
+                async for event in conn.iter_events():
+                    event_type = event.get("type", "unknown")
+                    print(f"   📥 Event: {event_type}")
+
+                    if event_type == "session.updated":
+                        print("\n✅ Session update confirmed!")
+                        break
+                    elif event_type == "error":
+                        print(f"\n❌ Server error: {event}")
+                        break
+        except asyncio.TimeoutError:
+            print("   (timeout - no more events)")
+
+        await conn.close()
+        print("\n✅ Connection closed cleanly")
+        return True
+
+    except Exception as e:
+        print(f"\n❌ Connection failed: {e}")
+        print(f"\nError type: {type(e).__name__}")
+
+        # Provide specific guidance based on error
+        error_str = str(e).lower()
+        if "401" in error_str or "unauthorized" in error_str:
+            print("\n💡 This looks like an authentication error.")
+            print("   - Check your API key is correct")
+            print("   - Make sure the key has access to the realtime model")
+        elif "404" in error_str or "not found" in error_str:
+            print("\n💡 This looks like a deployment not found error.")
+            print("   - Check LINGO_REALTIME_DEPLOYMENT is correct")
+            print("   - Make sure the deployment exists in your Azure resource")
+        elif "ssl" in error_str or "certificate" in error_str:
+            print("\n💡 This looks like an SSL/certificate error.")
+            print("   - Try setting ssl_verify=False for testing")
+        elif "timeout" in error_str or "connect" in error_str:
+            print("\n💡 This looks like a network connectivity error.")
+            print("   - Check your internet connection")
+            print("   - Check the API URL is correct")
+            print("   - Check firewall/proxy settings")
+
+        return False
+
+
+def main():
+    print("\n" + "=" * 60)
+    print("Azure OpenAI Realtime API Diagnostic Tool")
+    print("=" * 60)
+
+    # Load .env file
+    from dotenv import load_dotenv
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(env_path):
+        load_dotenv(env_path)
+        print(f"\nLoaded .env from: {env_path}")
+    else:
+        # Try parent directory
+        env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+        if os.path.exists(env_path):
+            load_dotenv(env_path)
+            print(f"\nLoaded .env from: {env_path}")
+        else:
+            print("\n⚠️  No .env file found!")
+            print("   Create one from .env.example")
+
+    # Step 1: Check env vars
+    if not check_env():
+        print("\n❌ Fix environment variables before continuing.")
+        return
+
+    # Step 2: Load config
+    config = check_config()
+    if not config:
+        print("\n❌ Fix configuration before continuing.")
+        return
+
+    # Step 3: Check realtime config
+    rt_config = check_realtime_config(config)
+    if not rt_config:
+        print("\n❌ Fix realtime configuration before continuing.")
+        return
+
+    # Step 4: Test connection
+    print("\nAttempting WebSocket connection...")
+    success = asyncio.run(test_connection(config))
+
+    # Summary
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+
+    if success:
+        print("\n✅ All checks passed! Your configuration is working.")
+        print("\nYou can now run the Streamlit app:")
+        print("   streamlit run LingoGPTConnector/test_realtime.py")
+    else:
+        print("\n❌ Connection test failed. See errors above.")
+        print("\nCommon fixes:")
+        print("1. Check your .env file has the correct values")
+        print("2. Make sure LINGO_REALTIME_DEPLOYMENT matches your Azure deployment name")
+        print("3. Verify your API key has access to the realtime model")
+        print("4. Check if gpt-4o-realtime-preview is deployed in your Azure resource")
+
+
+if __name__ == "__main__":
+    main()
