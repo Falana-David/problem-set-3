@@ -1,0 +1,165 @@
+"""Configuration for Azure OpenAI services including Realtime API."""
+
+import os
+import time
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Config:
+    def __init__(self):
+        self.openai_api_key = os.getenv("LINGO_OPENAI_API_KEY", None)
+
+        if os.getenv("OPENAI_RESOURCE_FLAG") == "KEY":
+            self.resource_flag = "KEY"
+            self.openai_api_url = os.getenv("LINGO_OPENAI_API_URL_KEY", None)
+            self.openai_api_35_version = os.getenv("LINGO_API_35_VERSION_KEY", None)
+            self.openai_api_4o_version = os.getenv("LINGO_API_4o_VERSION_KEY", None)
+            self.openai_embedding_version = os.getenv("LINGO_EMBEDDING_VERSION_KEY", None)
+            self.openai_whisper_version = os.getenv("LINGO_WHISPER_VERSION_KEY", None)
+
+            # FIXED: Added missing 'self.' prefix
+            self.openai_gpt_35_deployment = os.getenv("GPT_35_DEPLOYMENT_KEY", None)
+            self.openai_gpt_4o_deployment = os.getenv("GPT_4o_DEPLOYMENT_KEY", None)
+            self.openai_embedding_deployment = os.getenv("LINGO_EMBEDDING_DEPLOYMENT_KEY", None)
+            self.openai_whisper_deployment = os.getenv("LINGO_WHISPER_DEPLOYMENT_KEY", None)
+
+            # Not used in KEY mode, but keep defined so getters don't crash
+            self.openai_project_id = None
+
+        elif os.getenv("OPENAI_RESOURCE_FLAG") == "TOKEN":
+            self.resource_flag = "TOKEN"
+            self.openai_project_id = os.getenv("LINGO_OPENAI_PROJECT_ID", None)
+            self.openai_whisper_version = os.getenv("LINGO_WHISPER_VERSION_TOKEN", None)
+            self.openai_api_url = os.getenv("LINGO_OPENAI_API_URL_TOKEN", None)
+            self.openai_api_4o_version = os.getenv("LINGO_API_4o_VERSION_TOKEN", None)
+            self.openai_embedding_version = os.getenv("LINGO_EMBEDDING_VERSION_TOKEN", None)
+            self.openai_api_35_version = os.getenv("LINGO_API_35_VERSION_TOKEN", None)
+
+            self.openai_gpt_35_deployment = os.getenv("GPT_35_DEPLOYMENT_TOKEN", None)
+            self.openai_gpt_4o_deployment = os.getenv("GPT_4o_DEPLOYMENT_TOKEN", None)
+            self.openai_embedding_deployment = os.getenv("LINGO_EMBEDDING_DEPLOYMENT_TOKEN", None)
+            self.openai_whisper_deployment = os.getenv("LINGO_WHISPER_DEPLOYMENT_KEY", None)
+
+        else:
+            raise ValueError(
+                "Invalid resource flag. Please set OPENAI_RESOURCE_FLAG to 'KEY' or 'TOKEN' in your .env file."
+            )
+
+        # Realtime (WebSocket) config
+        self.openai_realtime_version = os.getenv("LINGO_REALTIME_API_VERSION", "2024-10-01-preview")
+        self.openai_realtime_deployment = os.getenv("LINGO_REALTIME_DEPLOYMENT", None)
+
+    def get_openai_token(self):
+        """Get or refresh OAuth token for TOKEN authentication mode."""
+        openai_token = os.getenv("OPENAI_TOKEN")
+        if openai_token is None:
+            return self.generate_new_openai_token()
+
+        openai_token_issue_time = os.getenv("OPENAI_TOKEN_ISSUE_TIME")
+        if (openai_token_issue_time is None) or (
+            int(time.time()) >= int(openai_token_issue_time) + 3590
+        ):
+            return self.generate_new_openai_token()
+
+        return openai_token
+
+    def generate_new_openai_token(self):
+        """Generate a new OAuth token using client credentials flow."""
+        auth = os.environ["OPENAI_AUTH_URL"]
+        client_id = os.environ["OPENAI_CLIENT_ID"]
+        client_secret = os.environ["OPENAI_CLIENT_SECRET"]
+        scope = os.environ["OPENAI_SCOPE"]
+        grant_type = "client_credentials"
+        issue_time = int(time.time())
+
+        with httpx.Client() as client:
+            body = {
+                "grant_type": grant_type,
+                "scope": scope,
+                "client_id": client_id,
+                "client_secret": client_secret,
+            }
+            resp = client.post(auth, data=body, timeout=60)
+            token = resp.json()["access_token"]
+
+        os.environ["OPENAI_TOKEN"] = token
+        os.environ["OPENAI_TOKEN_ISSUE_TIME"] = str(issue_time)
+        return token
+
+    def get_gpt_35_config(self):
+        return {
+            "resource_flag": self.resource_flag,
+            "api_key": self.openai_api_key,
+            "api_url": self.openai_api_url,
+            "api_version": self.openai_api_35_version,
+            "deployment": self.openai_gpt_35_deployment,
+        }
+
+    def get_gpt_4o_config(self):
+        if self.resource_flag == "KEY":
+            return {
+                "resource_flag": self.resource_flag,
+                "api_key": self.openai_api_key,
+                "api_url": self.openai_api_url,
+                "api_version": self.openai_api_4o_version,
+                "deployment": self.openai_gpt_4o_deployment,
+            }
+        elif self.resource_flag == "TOKEN":
+            return {
+                "resource_flag": self.resource_flag,
+                "api_url": self.openai_api_url,
+                "api_version": self.openai_api_4o_version,
+                "deployment": self.openai_gpt_4o_deployment,
+                "project_id": self.openai_project_id,
+            }
+
+    def get_embedding_config(self):
+        if self.resource_flag == "KEY":
+            return {
+                "resource_flag": self.resource_flag,
+                "api_key": self.openai_api_key,
+                "api_url": self.openai_api_url,
+                "api_version": self.openai_embedding_version,
+                "deployment": self.openai_embedding_deployment,
+            }
+        elif self.resource_flag == "TOKEN":
+            return {
+                "resource_flag": self.resource_flag,
+                "api_url": self.openai_api_url,
+                "api_version": self.openai_embedding_version,
+                "deployment": self.openai_embedding_deployment,
+                "project_id": self.openai_project_id,
+            }
+
+    def get_whisper_config(self):
+        return {
+            "resource_flag": self.resource_flag,
+            "api_key": self.openai_api_key,
+            "api_url": self.openai_api_url,
+            "api_version": self.openai_whisper_version,
+            "deployment": self.openai_whisper_deployment,
+        }
+
+    def get_realtime_config(self):
+        """Get configuration for Realtime WebSocket API."""
+        if not self.openai_realtime_deployment:
+            raise ValueError(
+                "Realtime deployment is missing. Set LINGO_REALTIME_DEPLOYMENT in your .env file."
+            )
+
+        cfg = {
+            "resource_flag": self.resource_flag,
+            "api_url": self.openai_api_url,
+            "api_version": self.openai_realtime_version,
+            "deployment": self.openai_realtime_deployment,
+        }
+
+        if self.resource_flag == "KEY":
+            cfg["api_key"] = self.openai_api_key
+        else:
+            cfg["project_id"] = self.openai_project_id
+
+        return cfg
