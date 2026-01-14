@@ -73,9 +73,15 @@ def check_env():
             missing.append(var)
 
     # Check optional but important
-    print("\nOptional variables:")
-    api_version = os.getenv("LINGO_REALTIME_API_VERSION", "2024-10-01-preview")
+    print("\nOptional/Realtime variables:")
+    api_version = os.getenv("LINGO_REALTIME_API_VERSION", "2025-04-01-preview")
+    ws_path = os.getenv("LINGO_REALTIME_WS_PATH", "openai/realtime")
+    upstream_env = os.getenv("LINGO_UPSTREAM_ENV", None)
     print(f"  ℹ️  LINGO_REALTIME_API_VERSION = {api_version}")
+    print(f"  ℹ️  LINGO_REALTIME_WS_PATH = {ws_path}")
+    print(f"  ℹ️  LINGO_UPSTREAM_ENV = {upstream_env or '(not set)'}")
+    if not upstream_env:
+        print(f"      ⚠️  For UHG gateway, set LINGO_UPSTREAM_ENV=prod")
 
     if missing:
         print(f"\n❌ Missing required variables: {missing}")
@@ -119,6 +125,19 @@ def check_realtime_config(config):
             else:
                 display = value
             print(f"   {key}: {display}")
+
+        # Show the full URL that will be constructed
+        api_url = rt_config.get("api_url", "")
+        ws_path = rt_config.get("ws_path", "openai/realtime")
+        if api_url.startswith("https://"):
+            ws_base = "wss://" + api_url[len("https://"):]
+        else:
+            ws_base = api_url
+        ws_base = ws_base.rstrip("/")
+
+        print(f"\n   Full WebSocket URL will be:")
+        print(f"   {ws_base}/{ws_path}?api-version=...&deployment=...")
+
         return rt_config
     except Exception as e:
         print(f"\n❌ Realtime config error: {e}")
@@ -131,20 +150,26 @@ async def test_connection(config):
     print("STEP 4: Testing WebSocket Connection")
     print("=" * 60)
 
-    client = RealtimeVoiceClient(config, ssl_verify=True)
+    client = RealtimeVoiceClient(config, ssl_verify=False)  # Disable SSL verify for enterprise
 
     # Build URL for display
     rt_config = config.get_realtime_config()
     api_url = rt_config.get("api_url", "")
+    ws_path = rt_config.get("ws_path", "openai/realtime")
     if api_url.startswith("https://"):
-        ws_url = "wss://" + api_url[len("https://"):]
+        ws_base = "wss://" + api_url[len("https://"):]
     else:
-        ws_url = api_url
-    ws_url = ws_url.rstrip("/")
-    ws_url = f"{ws_url}/openai/realtime?api-version={rt_config['api_version']}&deployment={rt_config['deployment']}"
+        ws_base = api_url
+    ws_base = ws_base.rstrip("/") + "/"
 
-    print(f"\nConnecting to: {ws_url}")
-    print("(This may take a few seconds...)\n")
+    print(f"\nBase URL: {ws_base}")
+    print(f"Path: {ws_path}")
+    print(f"Deployment: {rt_config['deployment']}")
+    print(f"API Version: {rt_config['api_version']}")
+    print(f"Auth mode: {rt_config['resource_flag']}")
+    if rt_config.get('x_upstream_env'):
+        print(f"x-upstream-env: {rt_config['x_upstream_env']}")
+    print("\n(Connecting with 15 second timeout...)\n")
 
     try:
         session_params = RealtimeSessionParams(
@@ -158,6 +183,7 @@ async def test_connection(config):
         conn = await client.connect(
             session_params=session_params,
             response_params=response_params,
+            connect_timeout=15.0,  # 15 second timeout
         )
 
         print("✅ Connection established!")
@@ -195,8 +221,8 @@ async def test_connection(config):
         error_str = str(e).lower()
         if "401" in error_str or "unauthorized" in error_str:
             print("\n💡 This looks like an authentication error.")
-            print("   - Check your API key is correct")
-            print("   - Make sure the key has access to the realtime model")
+            print("   - Check your API key or OAuth token is correct")
+            print("   - Make sure the credentials have access to the realtime model")
         elif "404" in error_str or "not found" in error_str:
             print("\n💡 This looks like a deployment not found error.")
             print("   - Check LINGO_REALTIME_DEPLOYMENT is correct")
@@ -204,7 +230,14 @@ async def test_connection(config):
         elif "ssl" in error_str or "certificate" in error_str:
             print("\n💡 This looks like an SSL/certificate error.")
             print("   - Try setting ssl_verify=False for testing")
-        elif "timeout" in error_str or "connect" in error_str:
+        elif "timeout" in error_str:
+            print("\n💡 Connection timed out. Possible causes:")
+            print("   - The WebSocket path might be incorrect for your gateway")
+            print("   - Try setting LINGO_REALTIME_WS_PATH to just 'realtime'")
+            print("   - The endpoint may not support WebSocket connections")
+            print("   - Firewall/proxy may be blocking WebSocket traffic")
+            print("   - The deployment may not exist or be offline")
+        elif "connect" in error_str:
             print("\n💡 This looks like a network connectivity error.")
             print("   - Check your internet connection")
             print("   - Check the API URL is correct")
