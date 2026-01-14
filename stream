@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""
+Streamlit test app for Azure OpenAI Realtime Voice API.
+
+This app provides a web interface to test the Realtime Voice API:
+- Record audio from your microphone
+- Send it to Azure OpenAI
+- Play back the audio response
+- View transcriptions in real-time
+
+Usage:
+    streamlit run LingoGPTConnector/test_realtime.py
+
+Requirements:
+    pip install streamlit streamlit-webrtc av numpy aiohttp python-dotenv pydub
+"""
+
+import asyncio
+import base64
+import io
+import logging
+import queue
+import struct
+import threading
+import wave
+from datetime import datetime
+from typing import Optional, List
+
+import numpy as np
+import streamlit as st
+
+try:
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode
+    import av
+    WEBRTC_AVAILABLE = True
+except ImportError:
+    WEBRTC_AVAILABLE = False
+
+from LingoGPTConnector.config import Config
+from LingoGPTConnector.client import GPTClient
+from LingoGPTConnector.realtime_voice import RealtimeConnection
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Audio settings - Azure Realtime API expects 24kHz mono PCM16
+SAMPLE_RATE = 24000
+CHANNELS = 1
+
+
+class RealtimeSession:
+    """Manages a session with the Realtime API."""
+
+    def __init__(self):
+        self.connection: Optional[RealtimeConnection] = None
+        self.audio_queue: queue.Queue = queue.Queue()
+        self.response_audio: List[bytes] = []
+        self.events: List[str] = []
+        self.transcript_user: str = ""
+        self.transcript_assistant: str = ""
+        self.is_connected = False
+        self.is_processing = False
+        self.stop_event = threading.Event()
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.thread: Optional[threading.Thread] = None
+
+    def start(self, voice: str, instructions: str):
+        """Start the session in a background thread."""
+        self.stop_event.clear()
+        self.thread = threading.Thread(
+            target=self._run_session,
+            args=(voice, instructions),
+            daemon=True
+        )
+        self.thread.start()
+
+    def _run_session(self, voice: str, instructions: str):
+        """Run the async session in its own event loop."""
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self._async_session(voice, instructions))
+        except Exception as e:
+            logger.error(f"Session error: {e}")
+            self.events.append(f"ERROR: {e}")
+        finally:
+            self.is_connected = False
+            self.loop.close()
+
+    async def _async_session(self, voice: str, instructions: str):
+        """Main async session loop."""
+        try:
+            # Connect to API
+            self.events.append("Connecting to Azure OpenAI Realtime API...")
+            config = Config()
+            client = GPTClient(config)
+
+            self.connection = await client.realtime_voice(
+                voice=voice,
+                server_vad=True,
+                instructions=instructions,
+                input_audio_transcription={"model": "whisper-1"},
+            )
+            self.is_connected = True
+            self.events.append("Connected! Ready to receive audio.")
+
+            # Create tasks for sending and receiving
+            sender = asyncio.create_task(self._send_audio_loop())
+            receiver = asyncio.create_task(self._receive_events_loop())
+
+            # Wait until stopped
+            await asyncio.gather(sender, receiver)
+
+        except Exception as e:
+            logger.error(f"Session error: {e}")
+            self.events.append(f"Error: {e}")
+        finally:
+            if self.connection:
+                await self.connection.close()
+            self.is_connected = False
+
+    async def _send_audio_loop(self):
+        """Send audio from queue to API."""
+        while not self.stop_event.is_set():
+            try:
+                audio_bytes = self.audio_queue.get(timeout=0.1)
+                if self.connection and self.is_connected:
+                    await self.connection.input_audio_append(audio_bytes)
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+            except Exception as e:
+                logger.error(f"Send error: {e}")
+                break
+
+    async def _receive_events_loop(self):
+        """Receive events from API."""
+        if not self.connection:
+            return
+
+        try:
+            async for event in self.connection.iter_events():
+                if self.stop_event.is_set():
+                    break
+
+                event_type = event.get("type", "")
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                self.events.append(f"[{timestamp}] {event_type}")
+
+                # Handle different event types
+                if event_type == "input_audio_buffer.speech_started":
+                    self.is_processing = True
+                    self.response_audio = []
+                    self.transcript_assistant = ""
+
+                elif event_type == "input_audio_buffer.speech_stopped":
+                    pass
+
+                elif event_type in ("response.audio.delta", "response.output_audio.delta"):
+                    delta = event.get("delta")
+                    if delta:
+                        self.response_audio.append(base64.b64decode(delta))
+
+                elif event_type == "response.audio_transcript.delta":
+                    self.transcript_assistant += event.get("delta", "")
+
+                elif event_type == "conversation.item.input_audio_transcription.completed":
+                    self.transcript_user = event.get("transcript", "")
+
+                elif event_type in ("response.audio.done", "response.output_audio.done"):
+                    self.is_processing = False
+
+                elif event_type == "error":
+                    self.events.append(f"SERVER ERROR: {event}")
+                    break
+
+        except Exception as e:
+            logger.error(f"Receive error: {e}")
+            self.events.append(f"Receive error: {e}")
+
+    def send_audio(self, audio_bytes: bytes):
+        """Queue audio for sending."""
+        if self.is_connected:
+            self.audio_queue.put(audio_bytes)
+
+    def get_response_audio_wav(self) -> Optional[bytes]:
+        """Get response audio as WAV bytes."""
+        if not self.response_audio:
+            return None
+
+        # Combine all audio chunks
+        pcm_data = b"".join(self.response_audio)
+
+        # Create WAV file
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as wav_file:
+            wav_file.setnchannels(CHANNELS)
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(SAMPLE_RATE)
+            wav_file.writeframes(pcm_data)
+
+        return wav_buffer.getvalue()
+
+    def stop(self):
+        """Stop the session."""
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=2.0)
+        self.is_connected = False
+
+
+def convert_audio_to_pcm16_24k(audio_bytes: bytes, input_sample_rate: int = 48000) -> bytes:
+    """Convert audio to PCM16 24kHz mono format."""
+    # Parse as int16
+    samples = np.frombuffer(audio_bytes, dtype=np.int16)
+
+    # Convert stereo to mono if needed
+    if len(samples) % 2 == 0:
+        # Assume stereo, take average
+        samples = samples.reshape(-1, 2).mean(axis=1).astype(np.int16)
+
+    # Resample if needed
+    if input_sample_rate != SAMPLE_RATE:
+        # Simple linear interpolation
+        duration = len(samples) / input_sample_rate
+        target_len = int(duration * SAMPLE_RATE)
+        indices = np.linspace(0, len(samples) - 1, target_len)
+        samples = np.interp(indices, np.arange(len(samples)), samples.astype(np.float32))
+        samples = samples.astype(np.int16)
+
+    return samples.tobytes()
+
+
+def audio_frame_callback(frame: av.AudioFrame) -> av.AudioFrame:
+    """Process audio frames from WebRTC."""
+    if "session" in st.session_state and st.session_state.session.is_connected:
+        # Get audio data
+        audio_data = frame.to_ndarray()
+
+        # Convert to mono
+        if len(audio_data.shape) > 1:
+            audio_data = audio_data.mean(axis=1)
+
+        # Convert to int16
+        if audio_data.dtype != np.int16:
+            audio_data = (audio_data * 32767).astype(np.int16)
+
+        # Resample to 24kHz
+        if frame.sample_rate != SAMPLE_RATE:
+            duration = len(audio_data) / frame.sample_rate
+            target_len = int(duration * SAMPLE_RATE)
+            if target_len > 0:
+                indices = np.linspace(0, len(audio_data) - 1, target_len)
+                audio_data = np.interp(indices, np.arange(len(audio_data)), audio_data.astype(np.float32))
+                audio_data = audio_data.astype(np.int16)
+
+        # Send to session
+        st.session_state.session.send_audio(audio_data.tobytes())
+
+    return frame
+
+
+def init_session_state():
+    """Initialize Streamlit session state."""
+    if "session" not in st.session_state:
+        st.session_state.session = None
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+
+def main():
+    st.set_page_config(
+        page_title="Azure OpenAI Realtime Voice",
+        page_icon="🎙️",
+        layout="wide"
+    )
+
+    init_session_state()
+
+    st.title("🎙️ Azure OpenAI Realtime Voice Test")
+
+    # Sidebar
+    with st.sidebar:
+        st.header("Configuration")
+
+        # Check config
+        try:
+            config = Config()
+            st.success(f"✅ Config loaded ({config.resource_flag} mode)")
+            with st.expander("Details"):
+                st.code(f"""
+API URL: {config.openai_api_url}
+Deployment: {config.openai_realtime_deployment}
+API Version: {config.openai_realtime_version}
+                """)
+        except Exception as e:
+            st.error(f"❌ Config error: {e}")
+            st.info("Create a .env file with your credentials.")
+            st.stop()
+
+        st.divider()
+
+        voice = st.selectbox(
+            "Voice",
+            ["alloy", "echo", "shimmer", "ash", "ballad", "coral", "sage", "verse"]
+        )
+
+        instructions = st.text_area(
+            "Instructions",
+            "You are a helpful voice assistant. Keep responses brief.",
+            height=100
+        )
+
+        st.divider()
+
+        # Connection controls
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if st.button("🔌 Connect", type="primary", use_container_width=True):
+                if st.session_state.session:
+                    st.session_state.session.stop()
+                st.session_state.session = RealtimeSession()
+                st.session_state.session.start(voice, instructions)
+                st.rerun()
+
+        with col2:
+            if st.button("⏹️ Disconnect", use_container_width=True):
+                if st.session_state.session:
+                    st.session_state.session.stop()
+                    st.session_state.session = None
+                st.rerun()
+
+        # Status
+        if st.session_state.session and st.session_state.session.is_connected:
+            st.success("🟢 Connected")
+        else:
+            st.warning("🔴 Disconnected")
+
+    # Main area
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        st.subheader("🎤 Audio Input")
+
+        if WEBRTC_AVAILABLE:
+            # WebRTC audio capture
+            webrtc_ctx = webrtc_streamer(
+                key="voice-input",
+                mode=WebRtcMode.SENDONLY,
+                audio_frame_callback=audio_frame_callback,
+                rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+                media_stream_constraints={"video": False, "audio": True},
+            )
+
+            if webrtc_ctx.state.playing:
+                if st.session_state.session and st.session_state.session.is_connected:
+                    st.info("🎤 Streaming audio to API... Speak now!")
+                else:
+                    st.warning("⚠️ Microphone active but not connected to API. Click Connect first.")
+        else:
+            st.warning("streamlit-webrtc not available. Install with: pip install streamlit-webrtc")
+
+        st.divider()
+
+        # Alternative: File upload
+        st.subheader("📁 Or Upload Audio")
+        uploaded = st.file_uploader("Upload WAV file", type=["wav"])
+
+        if uploaded and st.button("📤 Send File"):
+            if st.session_state.session and st.session_state.session.is_connected:
+                # Read WAV and convert
+                try:
+                    with wave.open(uploaded, "rb") as wav:
+                        frames = wav.readframes(wav.getnframes())
+                        sample_rate = wav.getframerate()
+
+                    pcm_data = convert_audio_to_pcm16_24k(frames, sample_rate)
+                    st.session_state.session.send_audio(pcm_data)
+                    st.success("Audio sent!")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+            else:
+                st.error("Not connected to API")
+
+    with col2:
+        st.subheader("📊 Status")
+
+        if st.session_state.session:
+            session = st.session_state.session
+
+            # Processing indicator
+            if session.is_processing:
+                st.info("⏳ Processing response...")
+
+            # Transcripts
+            st.markdown("**You said:**")
+            st.text(session.transcript_user or "(waiting...)")
+
+            st.markdown("**Assistant:**")
+            st.text(session.transcript_assistant or "(waiting...)")
+
+            # Response audio
+            if session.response_audio:
+                st.markdown("**Response Audio:**")
+                wav_bytes = session.get_response_audio_wav()
+                if wav_bytes:
+                    st.audio(wav_bytes, format="audio/wav")
+
+            # Events log
+            with st.expander("📋 Event Log"):
+                events_text = "\n".join(session.events[-30:])
+                st.text_area("Events", events_text, height=300, disabled=True, label_visibility="collapsed")
+
+            # Auto-refresh
+            if session.is_connected:
+                import time
+                time.sleep(0.5)
+                st.rerun()
+
+    # Instructions
+    with st.expander("ℹ️ How to Use"):
+        st.markdown("""
+        ### Quick Start
+
+        1. Click **Connect** to establish connection to Azure OpenAI
+        2. Click **START** on the microphone widget to enable audio capture
+        3. **Speak** into your microphone
+        4. Wait for the **response audio** to appear and play
+
+        ### Requirements
+
+        Your `.env` file needs:
+        ```
+        OPENAI_RESOURCE_FLAG=KEY
+        LINGO_OPENAI_API_KEY=your-key
+        LINGO_OPENAI_API_URL_KEY=https://your-resource.openai.azure.com
+        LINGO_REALTIME_API_VERSION=2024-10-01-preview
+        LINGO_REALTIME_DEPLOYMENT=gpt-4o-realtime-preview
+        ```
+
+        ### Install Dependencies
+        ```bash
+        pip install streamlit streamlit-webrtc av numpy aiohttp python-dotenv
+        ```
+        """)
+
+
+if __name__ == "__main__":
+    main()
