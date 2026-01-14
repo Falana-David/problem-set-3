@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""
+Direct test - bypasses Config.py entirely.
+Uses the EXACT same pattern as your company's working sample.
+
+If this works but the Config.py version doesn't, the issue is in Config.py.
+"""
+
+import aiohttp
+import asyncio
+import json
+import ssl
+import httpx
+import os
+import base64
+from dotenv import load_dotenv
+
+# Load environment
+load_dotenv()
+
+# SSL context (same as company sample)
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
+
+
+async def test_realtime_direct():
+    """Test realtime API using the exact same pattern as company sample."""
+
+    print("\n" + "=" * 60)
+    print("DIRECT TEST (bypassing Config.py)")
+    print("=" * 60)
+
+    # ===== CONFIGURATION - EDIT THESE IF NEEDED =====
+    # These match your company's sample exactly
+
+    BASE_URL = "https://api.uhg.com/api/cloud/api-management/ai-gateway/1.0"
+    AUTH_URL = "https://api.uhg.com/oauth2/token"
+    SCOPE = "https://api.uhg.com/.default"
+
+    # Get from environment or hardcode for testing
+    CLIENT_ID = os.getenv("OPENAI_CLIENT_ID") or os.getenv("UHG_CLIENT_ID")
+    CLIENT_SECRET = os.getenv("OPENAI_CLIENT_SECRET") or os.getenv("UHG_CLIENT_SECRET")
+    PROJECT_ID = os.getenv("LINGO_OPENAI_PROJECT_ID", "33de7400-191f-4e76-9e11-82a12254eced")
+
+    # Deployment - try the one from company sample
+    DEPLOYMENT = os.getenv("LINGO_REALTIME_DEPLOYMENT", "gpt-4o-mini-realtime-preview_2024-12-17")
+    API_VERSION = os.getenv("LINGO_REALTIME_API_VERSION", "2025-04-01-preview")
+    ENV = os.getenv("LINGO_UPSTREAM_ENV", "prod")
+
+    # ================================================
+
+    print(f"\nConfiguration:")
+    print(f"  Base URL: {BASE_URL}")
+    print(f"  Auth URL: {AUTH_URL}")
+    print(f"  Deployment: {DEPLOYMENT}")
+    print(f"  API Version: {API_VERSION}")
+    print(f"  Environment: {ENV}")
+    print(f"  Project ID: {PROJECT_ID}")
+    print(f"  Client ID: {CLIENT_ID[:8] if CLIENT_ID else 'NOT SET'}...")
+    print(f"  Client Secret: {'SET' if CLIENT_SECRET else 'NOT SET'}")
+
+    if not CLIENT_ID or not CLIENT_SECRET:
+        print("\n❌ ERROR: OPENAI_CLIENT_ID and OPENAI_CLIENT_SECRET must be set!")
+        print("   Or set UHG_CLIENT_ID and UHG_CLIENT_SECRET")
+        return False
+
+    # Step 1: Get OAuth token (exact same as company sample)
+    print("\n[1] Getting OAuth token...")
+    try:
+        with httpx.Client() as client:
+            body = {
+                "grant_type": "client_credentials",
+                "scope": SCOPE,
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+            }
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            resp = client.post(AUTH_URL, headers=headers, data=body, timeout=60)
+
+            if resp.status_code != 200:
+                print(f"❌ Token request failed: {resp.status_code}")
+                print(f"   Response: {resp.text}")
+                return False
+
+            access_token = resp.json()["access_token"]
+            print(f"✅ Got access token: {access_token[:20]}...")
+    except Exception as e:
+        print(f"❌ Failed to get token: {e}")
+        return False
+
+    # Step 2: Build WebSocket URL (exact same as company sample)
+    endpoint = BASE_URL.replace("https", "wss") + "/"
+
+    params = {
+        "deployment": DEPLOYMENT,
+        "api-version": API_VERSION,
+    }
+
+    ws_headers = {
+        "Authorization": f"Bearer {access_token}",
+        "x-upstream-env": ENV,
+        "projectId": PROJECT_ID,
+    }
+
+    print(f"\n[2] Connecting to WebSocket...")
+    print(f"    Endpoint: {endpoint}")
+    print(f"    Path: openai/realtime")
+    print(f"    Params: {params}")
+    print(f"    Headers: {list(ws_headers.keys())}")
+
+    # Step 3: Connect (exact same pattern as company sample)
+    try:
+        async with aiohttp.ClientSession(base_url=endpoint) as session:
+            async with session.ws_connect(
+                "openai/realtime",
+                headers=ws_headers,
+                params=params,
+                ssl=ssl_context,
+            ) as ws:
+                print("✅ WebSocket connected!")
+
+                # Step 4: Send session.update (same as company sample)
+                print("\n[3] Sending session.update...")
+                update = {
+                    "type": "session.update",
+                    "session": {
+                        "modalities": ["text", "audio"],
+                        "turn_detection": {"type": "server_vad"},
+                        "voice": "alloy",
+                        "input_audio_format": "pcm16",
+                        "output_audio_format": "pcm16",
+                    },
+                }
+                await ws.send_str(json.dumps(update))
+                print("✅ Sent session.update")
+
+                # Step 5: Listen for events
+                print("\n[4] Listening for events (10 seconds)...")
+
+                try:
+                    async with asyncio.timeout(10):
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = json.loads(msg.data)
+                                event_type = data.get("type", "unknown")
+                                print(f"    📥 {event_type}")
+
+                                if event_type == "session.created":
+                                    print("    ✅ Session created!")
+
+                                if event_type == "session.updated":
+                                    print("    ✅ Session updated!")
+
+                                if event_type == "error":
+                                    print(f"    ❌ Error: {data}")
+                                    break
+
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                print(f"    ❌ WS Error: {msg}")
+                                break
+
+                except asyncio.TimeoutError:
+                    print("    (timeout - no more events)")
+
+                print("\n[5] Closing WebSocket...")
+                await ws.close()
+                print("✅ Connection closed cleanly")
+
+                return True
+
+    except aiohttp.WSServerHandshakeError as e:
+        print(f"\n❌ Handshake error: {e}")
+        print(f"   Status: {e.status}")
+        print(f"   Message: {e.message}")
+        return False
+    except Exception as e:
+        print(f"\n❌ Connection error: {e}")
+        print(f"   Type: {type(e).__name__}")
+        return False
+
+
+async def test_with_text_message():
+    """Test with a text message (like company sample) to verify full flow."""
+
+    print("\n" + "=" * 60)
+    print("TEXT MESSAGE TEST")
+    print("=" * 60)
+
+    BASE_URL = "https://api.uhg.com/api/cloud/api-management/ai-gateway/1.0"
+    AUTH_URL = "https://api.uhg.com/oauth2/token"
+    SCOPE = "https://api.uhg.com/.default"
+
+    CLIENT_ID = os.getenv("OPENAI_CLIENT_ID") or os.getenv("UHG_CLIENT_ID")
+    CLIENT_SECRET = os.getenv("OPENAI_CLIENT_SECRET") or os.getenv("UHG_CLIENT_SECRET")
+    PROJECT_ID = os.getenv("LINGO_OPENAI_PROJECT_ID", "33de7400-191f-4e76-9e11-82a12254eced")
+    DEPLOYMENT = os.getenv("LINGO_REALTIME_DEPLOYMENT", "gpt-4o-mini-realtime-preview_2024-12-17")
+    API_VERSION = os.getenv("LINGO_REALTIME_API_VERSION", "2025-04-01-preview")
+    ENV = os.getenv("LINGO_UPSTREAM_ENV", "prod")
+
+    if not CLIENT_ID or not CLIENT_SECRET:
+        print("❌ Missing credentials")
+        return False
+
+    # Get token
+    print("\n[1] Getting OAuth token...")
+    with httpx.Client() as client:
+        body = {
+            "grant_type": "client_credentials",
+            "scope": SCOPE,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        }
+        resp = client.post(AUTH_URL, data=body, timeout=60)
+        access_token = resp.json()["access_token"]
+        print(f"✅ Got token")
+
+    endpoint = BASE_URL.replace("https", "wss") + "/"
+    params = {"deployment": DEPLOYMENT, "api-version": API_VERSION}
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "x-upstream-env": ENV,
+        "projectId": PROJECT_ID,
+    }
+
+    print("\n[2] Connecting and sending text message...")
+
+    try:
+        async with aiohttp.ClientSession(base_url=endpoint) as session:
+            async with session.ws_connect(
+                "openai/realtime",
+                headers=headers,
+                params=params,
+                ssl=ssl_context,
+            ) as ws:
+                print("✅ Connected")
+
+                # Session update
+                await ws.send_str(json.dumps({
+                    "type": "session.update",
+                    "session": {"turn_detection": {"type": "server_vad"}},
+                }))
+
+                # Send text message (same as company sample)
+                message = "Say hello in one word."
+                print(f"\n[3] Sending: '{message}'")
+
+                await ws.send_str(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": message}],
+                    },
+                }))
+
+                await ws.send_str(json.dumps({"type": "response.create"}))
+
+                # Wait for response
+                print("\n[4] Waiting for response...")
+                try:
+                    async with asyncio.timeout(30):
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = json.loads(msg.data)
+                                event_type = data.get("type", "")
+
+                                if event_type == "response.done":
+                                    try:
+                                        transcript = data["response"]["output"][0]["content"][0]["transcript"]
+                                        print(f"\n✅ Response: {transcript}")
+                                    except (KeyError, IndexError):
+                                        print(f"\n✅ Response received (no transcript)")
+                                    break
+                                elif event_type == "error":
+                                    print(f"\n❌ Error: {data}")
+                                    break
+                                else:
+                                    print(f"    {event_type}")
+
+                except asyncio.TimeoutError:
+                    print("\n⚠️ Timeout waiting for response")
+
+                return True
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        return False
+
+
+if __name__ == "__main__":
+    print("\nThis test bypasses Config.py to isolate the issue.")
+    print("If this works, the problem is in Config.py or how it's used.\n")
+
+    # Run basic connection test
+    success = asyncio.run(test_realtime_direct())
+
+    if success:
+        print("\n" + "=" * 60)
+        print("Basic connection WORKS! Now testing with text message...")
+        print("=" * 60)
+        asyncio.run(test_with_text_message())
+    else:
+        print("\n" + "=" * 60)
+        print("Connection failed - issue is NOT with Config.py")
+        print("Check your credentials and network access.")
+        print("=" * 60)
