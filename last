@@ -1,0 +1,195 @@
+import asyncio
+import base64
+import io
+import json
+import wave
+
+import numpy as np
+import streamlit as st
+
+from LingoGPTConnector.config import Config
+from LingoGPTConnector.realtime_voice import RealtimeVoiceClient, RealtimeSessionParams, RealtimeResponseParams
+
+
+# ---------- helpers ----------
+def run_async(coro):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        new_loop = asyncio.new_event_loop()
+        try:
+            return new_loop.run_until_complete(coro)
+        finally:
+            new_loop.close()
+    return asyncio.run(coro)
+
+
+def wav_to_pcm16_mono_and_sr(wav_bytes: bytes):
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        ch = wf.getnchannels()
+        sw = wf.getsampwidth()
+        sr = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+
+    if sw != 2:
+        raise ValueError(f"Expected 16-bit WAV; got sampwidth={sw}")
+
+    x = np.frombuffer(frames, dtype=np.int16)
+    if ch == 2:
+        x = x.reshape(-1, 2).mean(axis=1).astype(np.int16)
+    elif ch != 1:
+        raise ValueError(f"Unsupported channels={ch}")
+
+    return x.tobytes(), sr
+
+
+def resample_pcm16_mono(pcm: bytes, src_sr: int, dst_sr: int) -> bytes:
+    if src_sr == dst_sr:
+        return pcm
+    x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+    src_n = len(x)
+    dst_n = int(round(src_n * (dst_sr / src_sr)))
+
+    src_idx = np.arange(src_n, dtype=np.float32)
+    dst_idx = np.linspace(0, src_n - 1, dst_n, dtype=np.float32)
+    y = np.interp(dst_idx, src_idx, x)
+    y = np.clip(np.round(y), -32768, 32767).astype(np.int16)
+    return y.tobytes()
+
+
+def pcm16_to_wav(pcm: bytes, sr: int) -> bytes:
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm)
+    return out.getvalue()
+
+
+# ---------- realtime roundtrip ----------
+async def mic_roundtrip(wav_bytes: bytes, voice="alloy", target_sr=24000, chunk_ms=100):
+    cfg = Config()
+    rtc = RealtimeVoiceClient(cfg, ssl_verify=True)
+
+    # Push-to-talk mode: we explicitly commit
+    session_params = RealtimeSessionParams(
+        voice=voice,
+        input_audio_format="pcm16",
+        output_audio_format="pcm16",
+        turn_detection=None,
+        extra_session={
+            # being explicit helps some stacks
+            "input_audio_sampling_rate": target_sr,
+            "output_audio_sampling_rate": target_sr,
+        },
+    )
+
+    # Request BOTH modalities so you can see if text works even when audio fails
+    response_params = RealtimeResponseParams(
+        modalities=["audio", "text"],
+        instructions="Reply briefly.",
+    )
+
+    conn = await rtc.connect(session_params=session_params, response_params=response_params)
+
+    logs = []
+    audio_out = bytearray()
+    text_out = []
+
+    # Prepare PCM16 @ target_sr
+    pcm, src_sr = wav_to_pcm16_mono_and_sr(wav_bytes)
+    pcm = resample_pcm16_mono(pcm, src_sr, target_sr)
+
+    bytes_per_ms = int(target_sr * 2 / 1000)
+    chunk_bytes = max(640, bytes_per_ms * chunk_ms)
+
+    try:
+        # stream mic audio
+        for i in range(0, len(pcm), chunk_bytes):
+            await conn.input_audio_append(pcm[i : i + chunk_bytes])
+
+        await conn.input_audio_commit()
+        await conn.response_create()
+
+        saw_audio_done = False
+
+        async for evt in conn.iter_events():
+            t = evt.get("type")
+            logs.append({"type": t})
+
+            # ---- AUDIO: listen for BOTH naming conventions ----
+            if t in ("response.audio.delta", "response.output_audio.delta"):
+                delta_b64 = evt.get("delta", "")
+                if delta_b64:
+                    audio_out.extend(base64.b64decode(delta_b64))
+
+            if t in ("response.audio.done", "response.output_audio.done"):
+                saw_audio_done = True
+
+            # ---- TEXT (for debugging) ----
+            if t in ("response.text.delta", "response.output_text.delta"):
+                d = evt.get("delta")
+                if d:
+                    text_out.append(d)
+
+            # stop condition:
+            # - if we have audio_done, we can stop once response.done arrives (or just stop now)
+            if saw_audio_done and t in ("response.done",):
+                break
+
+            if t == "error":
+                raise RuntimeError(evt)
+
+        return {
+            "pcm16_audio": bytes(audio_out),
+            "text": "".join(text_out).strip(),
+            "logs": logs,
+            "sr": target_sr,
+        }
+
+    finally:
+        await conn.close()
+
+
+# ---------- Streamlit UI ----------
+st.set_page_config(page_title="Realtime Mic Minimal", layout="centered")
+st.title("Realtime Mic → Audio (Minimal)")
+
+st.caption(
+    "This tests GPT Realtime over WebSocket and listens for BOTH "
+    "`response.audio.delta` and `response.output_audio.delta`."
+)
+
+voice = st.selectbox("Voice", ["alloy", "aria", "sage", "ember", "verse", "coral"], index=0)
+
+audio_file = st.audio_input("Record", sample_rate=16000)
+
+if audio_file is not None:
+    user_wav = audio_file.read()
+    st.audio(user_wav, format="audio/wav")
+
+    if st.button("Send to Realtime"):
+        result = run_async(mic_roundtrip(user_wav, voice=voice))
+
+        st.subheader("Debug text (if any)")
+        st.write(result["text"] if result["text"] else "(no text deltas)")
+
+        st.subheader("Audio bytes received")
+        st.write(len(result["pcm16_audio"]))
+
+        if len(result["pcm16_audio"]) == 0:
+            st.error(
+                "No audio deltas received. If text deltas appear above, your deployment/route is text-capable "
+                "but not emitting output audio deltas."
+            )
+        else:
+            wav_out = pcm16_to_wav(result["pcm16_audio"], result["sr"])
+            st.success("Got assistant audio ✅")
+            st.audio(wav_out, format="audio/wav")
+            st.download_button("Download WAV", wav_out, file_name="assistant.wav", mime="audio/wav")
+
+        st.subheader("Event types seen")
+        st.code("\n".join([e["type"] for e in result["logs"]])[:20000])
