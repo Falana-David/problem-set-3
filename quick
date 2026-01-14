@@ -1,0 +1,58 @@
+import asyncio
+import base64
+from LingoGPTConnector.config import Config
+from LingoGPTConnector.realtime_voice import RealtimeVoiceClient, RealtimeSessionParams, RealtimeResponseParams
+
+async def main():
+    cfg = Config()
+    rtc = RealtimeVoiceClient(cfg, ssl_verify=True)
+
+    conn = await rtc.connect(
+        session_params=RealtimeSessionParams(
+            voice="alloy",
+            turn_detection=None,  # push-to-talk
+            extra_session={
+                "input_audio_sampling_rate": 24000,
+                "output_audio_sampling_rate": 24000,
+            },
+        ),
+        response_params=RealtimeResponseParams(
+            modalities=["audio", "text"],
+            instructions="Say one short sentence.",
+        ),
+    )
+
+    try:
+        # No mic audio: just send text to force a spoken response
+        await conn.send_event({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Say hello out loud."}]
+            }
+        })
+        await conn.response_create()
+
+        audio_bytes = bytearray()
+
+        async for evt in conn.iter_events():
+            t = evt.get("type")
+            print("EVENT:", t)
+
+            # listen to both common names
+            if t in ("response.audio.delta", "response.output_audio.delta"):
+                audio_bytes.extend(base64.b64decode(evt["delta"]))
+
+            if t in ("response.audio.done", "response.output_audio.done"):
+                break
+
+            if t == "error":
+                raise RuntimeError(evt)
+
+        print("AUDIO BYTES:", len(audio_bytes))
+
+    finally:
+        await conn.close()
+
+asyncio.run(main())
