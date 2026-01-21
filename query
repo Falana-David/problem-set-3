@@ -1,0 +1,221 @@
+What your user story is asking you to do
+
+Your user story says:
+
+“This POC is a continuation of implementing Azure AI Search. The goal is to run the test cases for Lingo Agents and record the vector search performance against the current GPT-4o model performance and record the metrics… compare on: accuracy, time, cost, ingestion/update ease, and limitations/enhancements vs Postgres.”
+
+Translated into plain English:
+
+You need to compare two ways of answering questions:
+A) Current baseline (“GPT-4o only”)
+
+Lingo agent answers using GPT-4o with its normal prompt/tooling
+
+No Azure retrieval step
+
+B) New approach (“Azure AI Search + GPT-4o”)
+
+Before GPT-4o answers, you query Azure AI Search (vector/hybrid)
+
+Take the top results and feed them into GPT-4o as grounding context
+
+Then measure whether answers become more correct, faster/slower, cheaper/more expensive, and easier/harder to operate
+
+And you must produce a metrics-backed report.
+
+What you are expected to do in code (to test)
+
+From your Magnus backend doc, your backend is a FastAPI service with a POST /generateResponse endpoint and a LangGraph entry point run_assistant(...) that streams events and returns a response. 
+
+Magnus+Backend+Documentation (1…
+
+
+So the cleanest testing strategy is: drive tests through /generateResponse (or directly call run_assistant) and instrument what happens.
+
+1) Add a switch for the two modes
+
+Add a config flag:
+
+RETRIEVAL_MODE=gpt_only
+
+RETRIEVAL_MODE=azure_search
+
+So your test harness can run the exact same test cases twice and compare outputs.
+
+Where it fits: right before you invoke the runnable/assistant logic described in the doc’s “Graph entry point” section (run_assistant) 
+
+Magnus+Backend+Documentation (1…
+
+.
+
+2) Implement “Azure retrieval” as a step that returns top-K chunks
+
+Create a function like:
+
+retrieve_context(query: str) -> list[Chunk]
+
+embed query
+
+call Azure AI Search
+
+return topK chunks + metadata (doc_id, chunk_id, score)
+
+Then, when RETRIEVAL_MODE=azure_search, you prepend retrieved context into the prompt/messages.
+
+Important: keep chunking + embedding model consistent across runs.
+
+3) Add instrumentation (metrics logging)
+
+For each test case run, log:
+
+Accuracy-related
+
+predicted answer
+
+optional: retrieved chunk IDs
+
+(later) pass/fail score
+
+Time-related
+
+total time
+
+(RAG) embedding time + search time + LLM time
+
+Cost-related
+
+input tokens / output tokens
+
+embedding tokens
+
+estimated cost (from your pricing model)
+
+This should be logged per test case into JSON/CSV for aggregation.
+
+4) Build a test runner that:
+
+Loads test cases from files
+
+Calls your endpoint (or direct function)
+
+Saves outputs + timings + token usage
+
+Produces a summary report
+
+Sample test files you should create
+
+You generally need three kinds of test artifacts:
+
+A) Test case definitions (inputs + expected)
+
+A file like tests/test_cases.jsonl (JSON lines) or tests/test_cases.json.
+
+Example format (JSONL is easier to append):
+
+tests/cases/lingo_cases.jsonl
+
+{"id":"TC001","category":"plan_recommendation","query":"Recommend a plan for this scenario...","expected_facts":["mentions deductible","asks for missing employerBeginDate"],"expected_behavior":["routes_to_plan_assistant"]}
+{"id":"TC002","category":"cirrus_lookup","query":"Find member details for John Doe in group 123...","expected_behavior":["routes_to_cirrus_assistant","calls_fetch_member_details"]}
+{"id":"TC003","category":"data_converter","query":"Extract NYS45 data from uploaded PDF","expected_behavior":["routes_to_data_converter","calls_extract_pdf_data"]}
+
+
+Why this matches your system: your architecture routes to specialized assistants and tools (Cirrus, plan recommendation, data converter) 
+
+Magnus+Backend+Documentation (1…
+
+, so your tests should validate:
+
+correctness of answer
+
+correctness of routing/tool usage (where applicable)
+
+B) Expected scoring rules (how to judge “accuracy”)
+
+A simple rubric file helps automation:
+
+tests/scoring/rules.yaml
+
+“must include phrases”
+
+“must call tool X”
+
+“must not hallucinate tool output”
+
+“must return JSON”
+
+Example (conceptually):
+
+TC001:
+  must_include: ["deductible", "premium"]
+  must_ask_for: ["effectiveDate"]
+TC002:
+  must_call_tool: "fetch_member_details"
+  must_not_include: ["I found John Doe's SSN"]  # unless tool returned it
+
+C) A runner script + baseline outputs
+
+You’ll want:
+
+Runner
+
+tests/run_benchmark.py
+
+runs each test in gpt_only
+
+runs each test in azure_search
+
+writes results
+
+Results output
+
+results/raw_runs.jsonl
+
+results/summary.csv
+
+Optional: golden outputs (if you do snapshot tests)
+
+tests/golden/gpt_only/TC001.json
+
+tests/golden/azure_search/TC001.json
+
+What “good” POC metrics output looks like
+
+Each row (one test run) should have at least:
+
+{
+  "test_id": "TC001",
+  "mode": "azure_search",
+  "ok": true,
+  "answer_text": "...",
+  "tool_calls": ["ToPlanRecommendationAssistant"],
+  "retrieved_chunks": [{"doc_id":"D12","chunk_id":"12-3","score":0.82}],
+  "latency_ms": 2430,
+  "search_latency_ms": 120,
+  "llm_latency_ms": 1950,
+  "prompt_tokens": 1800,
+  "completion_tokens": 250,
+  "estimated_cost_usd": 0.0034
+}
+
+
+Then your summary aggregates:
+
+Accuracy pass rate
+
+p50/p95 latency
+
+$/1k queries
+
+notes on ingestion/update and limitations
+
+The minimum you need to implement to be “done”
+
+A switch: gpt_only vs azure_search
+
+Azure retrieval function (topK context)
+
+Instrumentation (time + tokens + outputs)
+
+Test cases file + scoring rules
+
+Benchmark runner that outputs raw + summary
