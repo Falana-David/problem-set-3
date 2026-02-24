@@ -1,0 +1,155 @@
+1️⃣ Navigation & Entry
+
+A “Create an Agent” button is visible on the Marketplace homepage.
+
+Clicking the button opens a dedicated “Create an Agent” page.
+
+Page is accessible only to authenticated users.
+
+Page follows Marketplace UI design standards.
+
+2️⃣ Overview Section
+
+The page must include:
+
+A short explanation of what an agent is in this ecosystem.
+
+A brief explanation of why ADK is required.
+
+A high-level diagram or visual explaining:
+
+Build → Register → Publish → Use
+
+3️⃣ Step-by-Step Creation Instructions
+
+The page must clearly display the standardized workflow:
+
+Step 1 – Build the Agent
+
+Description of using Lingo Agent ADK
+
+Clear link to the Lingo Agent ADK repository
+
+Link opens in a new tab
+
+Instructions mention:
+
+Boilerplate generation
+
+Metadata definition
+
+Key generation (JWKS)
+
+Logging requirements
+
+Step 2 – Prepare Agent Metadata
+
+List required metadata fields:
+
+Agent Name
+
+Description
+
+Owner
+
+Business Unit
+
+Version
+
+Capabilities
+
+JWKS URL
+
+Manifest URL
+
+Clearly state metadata must align with Registry schema.
+
+Link to metadata specification documentation.
+
+Step 3 – Agent Registration (2-Step Process)
+
+The page must explicitly explain:
+
+Step 3A – Registry Submission
+
+Agent submits metadata to Registry.
+
+Registry generates Agent ID.
+
+Agent receives confirmation of registration.
+
+Step 3B – Marketplace Publication
+
+After Registry registration, agent must be published to Marketplace.
+
+Publication may require review/approval.
+
+Agent appears as:
+
+Public (synthetic-safe)
+
+Private (restricted)
+
+The 2-step process must be clearly labeled visually.
+
+Step 4 – Post-Registration Actions
+
+The page must list next steps:
+
+Enable Playground (if eligible)
+
+Configure access approval workflow
+
+Set capability visibility
+
+Define version policy
+
+Monitor usage
+
+4️⃣ Governance Notice
+
+Page must clearly state:
+
+All agents must use ADK standards.
+
+All agents must comply with security and logging requirements.
+
+Agents handling PHI require additional approval.
+
+Marketplace listing does not equal automatic client access.
+
+5️⃣ Links & Documentation
+
+The page must include:
+
+ADK Repository Link
+
+Metadata Schema Documentation Link
+
+Registration API Documentation Link
+
+Security Requirements Documentation Link
+
+Contact/Support Channel
+
+All links must be validated and open in new tabs.
+
+6️⃣ Error Handling & States
+
+If documentation links are unavailable, display fallback error message.
+
+If user lacks permission to view page, display access denied message.
+
+If feature is under maintenance, display banner notification.
+
+7️⃣ Non-Functional Requirements
+
+Page loads within acceptable UI performance threshold.
+
+Page is mobile-responsive.
+
+Page follows accessibility guidelines (WCAG compliant).
+
+Page supports versioned documentation updates.
+
+Page content is maintainable via content configuration (not hardcoded if possible).
