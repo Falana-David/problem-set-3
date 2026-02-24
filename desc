@@ -1,0 +1,29 @@
+As a developer using the Marketplace,
+I want a centralized “Create an Agent” onboarding page
+so that I understand the standardized process for building, registering, and publishing an agent within the enterprise ecosystem.
+
+This page will serve as the official Marketplace entry point for new agent creation and onboarding. It will guide developers step-by-step through:
+
+Building an agent using the Lingo Agent ADK
+
+Preparing required metadata
+
+Registering the agent in the Registry
+
+Understanding the 2-step registration process
+
+Publishing the agent to the Marketplace
+
+Next steps after registration (e.g., access approval, Playground eligibility)
+
+The page is informational and instructional only. It does not perform agent creation directly. It links to required repositories, documentation, and onboarding workflows.
+
+This feature ensures:
+
+Standardized onboarding
+
+Reduced confusion
+
+Alignment with enterprise architecture
+
+Proper governance before Marketplace listing
