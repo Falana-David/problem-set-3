@@ -1,0 +1,20 @@
+Option 2: Model of the Month
+Everyone uses the same model for 2–4 weeks.
+Collect feedback:
+Code quality
+Speed
+Hallucinations
+PR review comments
+Reevaluate monthly.
+
+This helps the team learn together and compare models fairly.
+
+Option 3: Task-Based Standards
+
+Instead of one model for everything:
+
+Feature development → Model A
+Debugging → Model B
+Documentation → Model C
+
+Create a short guide so everyone knows what tends to work best.
